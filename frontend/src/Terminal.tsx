@@ -117,6 +117,7 @@ const THEME_KEY = 'nexus_theme'
 const WINDOW_KEY = 'nexus_window'
 const TAP_THRESHOLD = 8
 const MAX_UPLOAD_NOTIFICATIONS = 5
+const INPUT_BAR_HEIGHT = 28
 
 export type ThemeMode = 'dark' | 'light'
 
@@ -1359,10 +1360,14 @@ export default function Terminal({ token }: Props) {
       isComposing: native.isComposing,
       inputType: native.inputType,
       refFlag: isComposingRef.current,
-    })) return // composition in progress — compositionEnd will send final text
-    // Fallback for Android (keydown fires key='Unidentified', onChange is reliable there)
+    })) {
+      // composition in progress — update preview, don't send
+      setCompositionText(e.target.value)
+      return
+    }
     const val = e.target.value
     if (val) { sendToWs(val); e.target.value = '' }
+    setCompositionText('')
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -1382,22 +1387,28 @@ export default function Terminal({ token }: Props) {
     const text = e.data
     if (text) sendToWs(text)
     ;(e.currentTarget as HTMLInputElement).value = ''
+    setCompositionText('')
   }
 
   // Track keyboard visibility and adjust layout height on mobile
   const [vvHeight, setVvHeight] = useState<number | null>(null)
+  const [keyboardVisible, setKeyboardVisible] = useState(false)
+  const [compositionText, setCompositionText] = useState('')
   // 文件上传覆盖确认对话框状态
   const [uploadConflict, setUploadConflict] = useState<{ show: boolean; file: File | null; filename: string }>({ show: false, file: null, filename: '' })
   useEffect(() => {
-    if (isWidePC) {
-      setVvHeight(null)
-      return
-    }
     const vv = window.visualViewport
     if (!vv) return
+    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0
     const handleResize = () => {
-      keyboardVisibleRef.current = vv.height < window.innerHeight * 0.8
-      setVvHeight(Math.round(vv.height))
+      const kbVisible = isTouch && vv.height < window.innerHeight * 0.8
+      keyboardVisibleRef.current = kbVisible
+      setKeyboardVisible(kbVisible)
+      if (!isWidePC || kbVisible) {
+        setVvHeight(Math.round(vv.height))
+      } else {
+        setVvHeight(null)
+      }
     }
     handleResize()
     vv.addEventListener('resize', handleResize)
@@ -1721,6 +1732,26 @@ export default function Terminal({ token }: Props) {
             </div>
             <div className="flex-1 flex flex-col min-w-0 relative">
               <div ref={containerRef} className="flex-1 overflow-hidden relative" />
+              {keyboardVisible && (
+                <div style={{
+                  height: INPUT_BAR_HEIGHT,
+                  flexShrink: 0,
+                  background: 'var(--nexus-bg)',
+                  color: 'var(--nexus-text)',
+                  fontFamily: 'Menlo, Monaco, "Cascadia Code", "Fira Code", monospace',
+                  fontSize: 14,
+                  padding: '0 10px',
+                  borderTop: '1px solid var(--nexus-border)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  overflow: 'hidden',
+                  whiteSpace: 'nowrap',
+                }}>
+                  <span style={{ opacity: compositionText ? 1 : 0.3 }}>
+                    {compositionText || '·'}
+                  </span>
+                </div>
+              )}
               {isConnecting && (
                 <div className="absolute inset-0 bg-nexus-bg flex flex-col items-center justify-center gap-3 z-10">
                   <div className="w-8 h-8 border-[3px] border-nexus-border border-t-nexus-accent rounded-full animate-spin" />
@@ -1747,7 +1778,27 @@ export default function Terminal({ token }: Props) {
               <button className="absolute bottom-3 right-3 w-9 h-9 rounded-full bg-nexus-accent border-none text-white text-lg cursor-pointer z-50 flex items-center justify-center shadow-lg backdrop-blur-sm" onClick={scrollToBottom} title="滚到底部"><Icon name="arrowDown" size={16} /></button>
             )}
           </div>
-          <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={toolbarHeightRef.current} />
+          <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={toolbarHeightRef.current + (keyboardVisible ? INPUT_BAR_HEIGHT : 0)} />
+          {keyboardVisible && (
+            <div style={{
+              height: INPUT_BAR_HEIGHT,
+              flexShrink: 0,
+              background: 'var(--nexus-bg)',
+              color: 'var(--nexus-text)',
+              fontFamily: 'Menlo, Monaco, "Cascadia Code", "Fira Code", monospace',
+              fontSize: 14,
+              padding: '0 10px',
+              borderTop: '1px solid var(--nexus-border)',
+              display: 'flex',
+              alignItems: 'center',
+              overflow: 'hidden',
+              whiteSpace: 'nowrap',
+            }}>
+              <span style={{ opacity: compositionText ? 1 : 0.3 }}>
+                {compositionText || '·'}
+              </span>
+            </div>
+          )}
           <div ref={toolbarWrapRef}><Toolbar {...toolbarProps} /></div>
         </div>
       )}
