@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import GhostShield from './GhostShield'
 import { Icon } from './icons'
+import { apiFetch } from './lib/api'
 
 // 检测是否为 PC 端（>= 768px）
 function useIsDesktop() {
@@ -28,7 +29,6 @@ interface Config {
 }
 
 interface Props {
-  token: string
   onClose: () => void
 }
 
@@ -44,7 +44,7 @@ const EMPTY_CONFIG: Omit<Config, 'id'> = {
   API_TIMEOUT_MS: '3000000',
 }
 
-export default function SessionManager({ token, onClose }: Props) {
+export default function SessionManager({ onClose }: Props) {
   const { t } = useTranslation()
   const isDesktop = useIsDesktop()
 
@@ -54,12 +54,10 @@ export default function SessionManager({ token, onClose }: Props) {
   const [savingCfg, setSavingCfg] = useState(false)
   const [cfgError, setCfgError] = useState<string | null>(null)
 
-  const headers = { Authorization: `Bearer ${token}` }
-
   async function fetchConfigs() {
     setLoadingCfg(true)
     try {
-      const r = await fetch('/api/configs', { headers })
+      const r = await apiFetch('/api/configs')
       setConfigs(r.ok ? await r.json() : [])
     } catch { setConfigs([]) }
     finally { setLoadingCfg(false) }
@@ -73,9 +71,9 @@ export default function SessionManager({ token, onClose }: Props) {
     if (!id.trim() || !data.label.trim()) { setCfgError('ID 和名称不能为空'); return }
     setSavingCfg(true); setCfgError(null)
     try {
-      const r = await fetch(`/api/configs/${id.trim()}`, {
+      const r = await apiFetch(`/api/configs/${id.trim()}`, {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -88,7 +86,7 @@ export default function SessionManager({ token, onClose }: Props) {
 
   async function deleteConfig(id: string) {
     try {
-      await fetch(`/api/configs/${id}`, { method: 'DELETE', headers })
+      await apiFetch(`/api/configs/${id}`, { method: 'DELETE' })
       await fetchConfigs()
     } catch { /* ignore */ }
   }

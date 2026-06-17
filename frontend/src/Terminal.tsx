@@ -1,6 +1,9 @@
 import { useEffect, useRef, useCallback, useState, lazy, Suspense } from 'react'
 import type { SessionManagerV2Handle } from './SessionManagerV2'
 import { useTranslation } from 'react-i18next'
+import { mapSpecialKey, shouldSkipInput } from './mobileInput'
+import { detectKeyboardVisible } from './viewportKeyboard'
+import { scrollbackKey } from './scrollbackCachePolicy'
 import { Terminal as XTerm, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -10,6 +13,7 @@ import SessionFAB from './SessionFAB'
 import GhostShield from './GhostShield'
 import { Icon } from './icons'
 import { getWindowStatus, STATUS_DOT_COLOR, STATUS_DOT_TITLE } from './windowStatus'
+import { apiFetch, handleAuthFailure } from './lib/api'
 
 // ANSI 256-color palette (0-15 standard, 16-231 6x6x6 cube, 232-255 grayscale)
 const ANSI256: string[] = (() => {
@@ -116,6 +120,7 @@ const THEME_KEY = 'nexus_theme'
 const WINDOW_KEY = 'nexus_window'
 const TAP_THRESHOLD = 8
 const MAX_UPLOAD_NOTIFICATIONS = 5
+const INPUT_BAR_HEIGHT = 28
 
 export type ThemeMode = 'dark' | 'light'
 
@@ -232,8 +237,8 @@ export default function Terminal({ token }: Props) {
   const swipeUpAccumRef = useRef(0)
   const scrollbackOverlayRef = useRef<HTMLDivElement>(null)
   const triggerScrollbackRef = useRef<() => void>(() => {})
-  const scrollbackPrefetchRef = useRef<Promise<{ content: string }> | null>(null)
-  const scrollbackCacheRef = useRef<string | null>(null)
+  const scrollbackPrefetchRef = useRef<Record<string, Promise<{ content: string }> | undefined>>({})
+  const scrollbackCacheRef = useRef<Record<string, string>>({})
   const pausePollingRef = useRef(false)
   const activeWindowIndexRef = useRef(0)
   const windowsInitializedRef = useRef(false)
@@ -288,7 +293,7 @@ export default function Terminal({ token }: Props) {
 
   // 加载服务端默认 session
   useEffect(() => {
-    fetch('/api/config', { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch('/api/config')
       .then(r => r.json())
       .then(d => {
         if (d.tmuxSession && !localStorage.getItem('nexus_session')) {
@@ -303,7 +308,7 @@ export default function Terminal({ token }: Props) {
   useEffect(() => {
     const fetchSessions = async () => {
       try {
-        const r = await fetch('/api/tmux-sessions', { headers: { Authorization: `Bearer ${token}` } })
+        const r = await apiFetch('/api/tmux-sessions')
         if (r.ok) {
           const sessions = await r.json()
           setTmuxSessions(sessions.map((s: any) => s.name))
@@ -312,7 +317,7 @@ export default function Terminal({ token }: Props) {
     }
     const fetchProjects = async () => {
       try {
-        const r = await fetch('/api/projects', { headers: { Authorization: `Bearer ${token}` } })
+        const r = await apiFetch('/api/projects')
         if (r.ok) {
           setProjects(await r.json())
         }
@@ -439,7 +444,7 @@ export default function Terminal({ token }: Props) {
       const outputs: Record<number, any> = {}
       for (const win of windows) {
         try {
-          const r = await fetch(`/api/sessions/${win.index}/output?session=${encodeURIComponent(activeTmuxSession)}`, { headers: { Authorization: `Bearer ${token}` } })
+          const r = await apiFetch(`/api/sessions/${win.index}/output?session=${encodeURIComponent(activeTmuxSession)}`)
           if (r.ok) outputs[win.index] = await r.json()
         } catch {}
       }
@@ -478,6 +483,26 @@ export default function Terminal({ token }: Props) {
       })
     }, 150)
   }, [])
+
+  function prefetchScrollback(windowIndex = activeWindowIndexRef.current, session = activeTmuxSessionRef.current) {
+    const key = scrollbackKey(session, windowIndex)
+    if (scrollbackCacheRef.current[key] !== undefined || scrollbackPrefetchRef.current[key]) {
+      return scrollbackPrefetchRef.current[key]
+    }
+    const promise = apiFetch(`/api/sessions/${windowIndex}/scrollback?session=${encodeURIComponent(session)}&lines=3000`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then((data: { content: string }) => {
+        scrollbackCacheRef.current[key] = data.content.trimEnd()
+        delete scrollbackPrefetchRef.current[key]
+        return data
+      })
+      .catch(() => {
+        delete scrollbackPrefetchRef.current[key]
+        return { content: '' }
+      })
+    scrollbackPrefetchRef.current[key] = promise
+    return promise
+  }
 
   // 简化的 resize 处理：只在必要时执行，避免过度工程化
   useEffect(() => {
@@ -547,7 +572,7 @@ export default function Terminal({ token }: Props) {
   async function fetchWindows() {
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions?session=${encodeURIComponent(session)}`, { headers: { Authorization: `Bearer ${token}` } })
+      const r = await apiFetch(`/api/sessions?session=${encodeURIComponent(session)}`)
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const d = await r.json()
       const wins = d.windows ?? []
@@ -596,9 +621,8 @@ export default function Terminal({ token }: Props) {
 
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions/${index}/attach?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/sessions/${index}/attach?session=${encodeURIComponent(session)}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
       })
       if (r.ok) {
         setActiveWindowIndex(index)
@@ -622,9 +646,8 @@ export default function Terminal({ token }: Props) {
   async function closeWindow(index: number) {
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions/${index}?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/sessions/${index}?session=${encodeURIComponent(session)}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
       })
       if (r.ok) {
         await fetchWindows()
@@ -637,9 +660,9 @@ export default function Terminal({ token }: Props) {
   async function renameWindow(index: number, name: string) {
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions/${index}/rename?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/sessions/${index}/rename?session=${encodeURIComponent(session)}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
       })
       if (r.ok) {
@@ -653,9 +676,9 @@ export default function Terminal({ token }: Props) {
   async function createSession(relPath: string, shellType: 'claude' | 'bash' = 'claude', profile?: string) {
     try {
       // F-20: 使用 /api/projects 创建新的 project（tmux session）
-      const r = await fetch('/api/projects', {
+      const r = await apiFetch('/api/projects', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: relPath, shell_type: shellType, profile }),
       })
       if (r.ok) {
@@ -676,18 +699,16 @@ export default function Terminal({ token }: Props) {
       const currentProject = projects.find(p => p.name === session)
       const projectPath = currentProject?.path
       // 修复：使用正确的 API 端点 /api/projects/:name/channels
-      const r = await fetch(`/api/projects/${encodeURIComponent(session)}/channels`, {
+      const r = await apiFetch(`/api/projects/${encodeURIComponent(session)}/channels`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shell_type: shellType, profile, path: projectPath }),
       })
       if (r.ok) {
         const { name: newWindowName } = await r.json()
         await new Promise(resolve => setTimeout(resolve, 300))
         const sessionNow = activeTmuxSessionRef.current
-        const listRes = await fetch(`/api/sessions?session=${encodeURIComponent(sessionNow)}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        })
+        const listRes = await apiFetch(`/api/sessions?session=${encodeURIComponent(sessionNow)}`)
         if (listRes.ok) {
           const d = await listRes.json()
           const wins: TmuxWindow[] = d.windows ?? []
@@ -757,9 +778,8 @@ export default function Terminal({ token }: Props) {
     try {
       const sessionParam = `session=${encodeURIComponent(activeTmuxSessionRef.current)}`
       const url = overwrite ? `/api/files/upload?overwrite=1&${sessionParam}` : `/api/files/upload?${sessionParam}`
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
         body: formData,
       })
       if (res.status === 409) {
@@ -778,6 +798,14 @@ export default function Terminal({ token }: Props) {
       if (term) {
         term.writeln(`\r\n\x1b[32m[Nexus: 文件已上传]\x1b[0m ${filename}`)
         if (fullPath) term.writeln(`\x1b[36m路径: ${fullPath}\x1b[0m`)
+      }
+      // 上传成功后自动注入 prompt 到终端输入行（不自动回车）
+      if (fullPath) {
+        const isImageVideo = file.type.startsWith('image/') || file.type.startsWith('video/')
+        const prompt = isImageVideo
+          ? `请读取并分析这张图片：${fullPath} `
+          : `请读取这个文件：${fullPath} `
+        sendToWs(prompt)
       }
     } catch (e: any) {
       console.error('Upload failed:', e)
@@ -1082,19 +1110,9 @@ export default function Terminal({ token }: Props) {
           touchLastY = y
           if (deltaY < 0) {  // finger DOWN = swipe down = view history
             swipeUpAccumRef.current += -deltaY
-            if (swipeUpAccumRef.current > 10 && !scrollbackPrefetchRef.current && scrollbackCacheRef.current === null) {
+            if (swipeUpAccumRef.current > 10) {
               // Pre-fetch while gesture is still building up
-              const wi = activeWindowIndexRef.current
-              const s = activeTmuxSessionRef.current
-              scrollbackPrefetchRef.current = fetch(`/api/sessions/${wi}/scrollback?session=${encodeURIComponent(s)}&lines=3000`, {
-                headers: { Authorization: `Bearer ${token}` },
-              }).then(r => r.ok ? r.json() : Promise.reject(r.status))
-                .then((data: { content: string }) => {
-                  scrollbackCacheRef.current = data.content.trimEnd()
-                  scrollbackPrefetchRef.current = null
-                  return data
-                })
-                .catch(() => { scrollbackPrefetchRef.current = null; return { content: '' } })
+              prefetchScrollback()
             }
             if (swipeUpAccumRef.current > 40) {
               triggerScrollbackRef.current()
@@ -1315,17 +1333,24 @@ export default function Terminal({ token }: Props) {
             wsRef.current.send(JSON.stringify({ type: 'resize', cols: termRef.current.cols, rows: termRef.current.rows }))
           }
         })
+        window.setTimeout(() => prefetchScrollback(wi, s), 500)
       }
 
       newWs.onmessage = (e) => {
         writeTerm(e.data)
+        const key = scrollbackKey(activeTmuxSessionRef.current, activeWindowIndexRef.current)
+        delete scrollbackCacheRef.current[key]
+        if (!scrollbackPrefetchRef.current[key]) {
+          window.setTimeout(() => prefetchScrollback(activeWindowIndexRef.current, activeTmuxSessionRef.current), 250)
+        }
         if (!userScrolledRef.current) termRef.current?.scrollToBottom()
       }
 
       newWs.onclose = (e) => {
         if (intentionalClose) return
         if (e.code === 4001) {
-          writeTerm('\r\n\x1b[31m[Nexus: 认证失败，请刷新重新登录]\x1b[0m\r\n')
+          writeTerm('\r\n\x1b[31m[Nexus: 登录已过期，正在返回登录页...]\x1b[0m\r\n')
+          handleAuthFailure()
           return
         }
         if (reconnectAttempts >= maxReconnectAttempts) {
@@ -1353,38 +1378,31 @@ export default function Terminal({ token }: Props) {
   const isComposingRef = useRef(false)
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    if (isComposingRef.current) return // handled by compositionEnd
-    // Fallback for Android (keydown fires key='Unidentified', onChange is reliable there)
+    const native = e.nativeEvent as InputEvent
+    if (shouldSkipInput({
+      isComposing: native.isComposing,
+      inputType: native.inputType,
+      refFlag: isComposingRef.current,
+    })) {
+      // composition in progress — update preview, don't send
+      setCompositionText(e.target.value)
+      return
+    }
     const val = e.target.value
     if (val) { sendToWs(val); e.target.value = '' }
+    setCompositionText('')
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (isComposingRef.current) return
-    if (e.key === 'Enter') { e.preventDefault(); sendToWs('\r') }
-    else if (e.key === 'Backspace') { e.preventDefault(); sendToWs('\x7f') }
-    else if (e.key === 'Tab') { e.preventDefault(); sendToWs('\t') }
-    else if (e.key === 'Escape') { e.preventDefault(); sendToWs('\x1b') }
-    else if (e.key === 'Delete') { e.preventDefault(); sendToWs('\x1b[3~') }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); sendToWs('\x1b[A') }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); sendToWs('\x1b[B') }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); sendToWs('\x1b[C') }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); sendToWs('\x1b[D') }
-    else if (e.key === 'Home') { e.preventDefault(); sendToWs('\x1b[H') }
-    else if (e.key === 'End') { e.preventDefault(); sendToWs('\x1b[F') }
-    else if (e.key === 'PageUp') { e.preventDefault(); sendToWs('\x1b[5~') }
-    else if (e.key === 'PageDown') { e.preventDefault(); sendToWs('\x1b[6~') }
-    else if (e.ctrlKey && e.key.length === 1) {
+    const mapped = mapSpecialKey(e.key, e.ctrlKey)
+    if (mapped !== null) {
       e.preventDefault()
-      sendToWs(String.fromCharCode(e.key.toLowerCase().charCodeAt(0) - 96))
+      sendToWs(mapped)
     }
-    else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      // Intercept printable chars (letters, digits, punctuation) directly from keydown.
-      // preventDefault stops the browser from updating input.value, so onChange won't
-      // double-fire. This is reliable on iOS/desktop where e.key is always correct.
-      e.preventDefault()
-      sendToWs(e.key)
-    }
+    // Printable chars, Unidentified, modifier+char combos fall through.
+    // They populate input.value and trigger onChange → handleInputChange,
+    // which is guarded by isComposingRef during IME composition.
   }
 
   function handleCompositionEnd(e: React.CompositionEvent<HTMLInputElement>) {
@@ -1392,22 +1410,38 @@ export default function Terminal({ token }: Props) {
     const text = e.data
     if (text) sendToWs(text)
     ;(e.currentTarget as HTMLInputElement).value = ''
+    setCompositionText('')
   }
 
   // Track keyboard visibility and adjust layout height on mobile
   const [vvHeight, setVvHeight] = useState<number | null>(null)
+  const [keyboardVisible, setKeyboardVisible] = useState(false)
+  const [compositionText, setCompositionText] = useState('')
+  const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false)
+  // 移动端无键盘时 compact bar 展开状态
+  const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false)
+  const maxViewportHeightRef = useRef(typeof window !== 'undefined' ? window.innerHeight : 0)
   // 文件上传覆盖确认对话框状态
   const [uploadConflict, setUploadConflict] = useState<{ show: boolean; file: File | null; filename: string }>({ show: false, file: null, filename: '' })
   useEffect(() => {
-    if (isWidePC) {
-      setVvHeight(null)
-      return
-    }
     const vv = window.visualViewport
     if (!vv) return
+    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0
     const handleResize = () => {
-      keyboardVisibleRef.current = vv.height < window.innerHeight * 0.8
-      setVvHeight(Math.round(vv.height))
+      maxViewportHeightRef.current = Math.max(maxViewportHeightRef.current, vv.height, window.innerHeight)
+      const kbVisible = detectKeyboardVisible({
+        isTouch,
+        viewportHeight: vv.height,
+        maxViewportHeight: maxViewportHeightRef.current,
+      })
+      keyboardVisibleRef.current = kbVisible
+      setKeyboardVisible(kbVisible)
+      if (!kbVisible) setShowKeyboardShortcuts(false)
+      if (!isWidePC || kbVisible) {
+        setVvHeight(Math.round(vv.height))
+      } else {
+        setVvHeight(null)
+      }
     }
     handleResize()
     vv.addEventListener('resize', handleResize)
@@ -1468,8 +1502,7 @@ export default function Terminal({ token }: Props) {
     showScrollbackRef.current = false
     setShowScrollback(false)
     setScrollbackContent('')
-    scrollbackCacheRef.current = null
-    scrollbackPrefetchRef.current = null
+    // Keep cached scrollback for instant reopen; next window/session uses keyed cache.
   }
 
   function handleOverlayScroll(e: React.UIEvent<HTMLDivElement>) {
@@ -1486,22 +1519,19 @@ export default function Terminal({ token }: Props) {
     swipeUpAccumRef.current = 0
     setShowScrollback(true)
 
+    const wi = activeWindowIndexRef.current
+    const s = activeTmuxSessionRef.current
+    const key = scrollbackKey(s, wi)
+
     // Use pre-fetched cache if available (no loading flash)
-    if (scrollbackCacheRef.current !== null) {
-      setScrollbackContent(scrollbackCacheRef.current)
+    if (scrollbackCacheRef.current[key] !== undefined) {
+      setScrollbackContent(scrollbackCacheRef.current[key])
       setScrollbackLoading(false)
       return
     }
 
     setScrollbackLoading(true)
-    const wi = activeWindowIndexRef.current
-    const s = activeTmuxSessionRef.current
-    const promise = scrollbackPrefetchRef.current ??
-      fetch(`/api/sessions/${wi}/scrollback?session=${encodeURIComponent(s)}&lines=3000`, {
-        headers: { Authorization: `Bearer ${token}` },
-      }).then(r => r.ok ? r.json() : Promise.reject(r.status))
-
-    scrollbackPrefetchRef.current = null
+    const promise = scrollbackPrefetchRef.current[key] ?? prefetchScrollback(wi, s)!
     promise
       .then(({ content }: { content: string }) => {
         setScrollbackContent(content.trimEnd())
@@ -1540,6 +1570,42 @@ export default function Terminal({ token }: Props) {
     collapsed: toolbarCollapsed,
     onCollapsedChange: setToolbarCollapsed,
   }
+
+  const imePreviewBar = keyboardVisible ? (
+    <div style={{
+      height: INPUT_BAR_HEIGHT,
+      flexShrink: 0,
+      background: 'var(--nexus-bg)',
+      color: 'var(--nexus-text)',
+      fontFamily: 'Menlo, Monaco, "Cascadia Code", "Fira Code", monospace',
+      fontSize: 14,
+      padding: '0 8px',
+      borderTop: '1px solid var(--nexus-border)',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      overflow: 'hidden',
+      whiteSpace: 'nowrap',
+    }}>
+      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', opacity: compositionText ? 1 : 0.3 }}>
+        {compositionText || '·'}
+      </span>
+      <button
+        onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setShowKeyboardShortcuts(v => !v) }}
+        style={{
+          width: 34,
+          height: 24,
+          borderRadius: 6,
+          border: '1px solid var(--nexus-border)',
+          background: showKeyboardShortcuts ? 'var(--nexus-accent)' : 'var(--nexus-bg2)',
+          color: showKeyboardShortcuts ? '#fff' : 'var(--nexus-text)',
+          fontSize: 13,
+          fontFamily: 'inherit',
+        }}
+        aria-label="快捷键"
+      >⌘</button>
+    </div>
+  ) : null
 
   return (
     <div className="flex flex-col w-full relative" style={{ height: vvHeight ?? '100dvh' }}>
@@ -1731,6 +1797,7 @@ export default function Terminal({ token }: Props) {
             </div>
             <div className="flex-1 flex flex-col min-w-0 relative">
               <div ref={containerRef} className="flex-1 overflow-hidden relative" />
+              {imePreviewBar}
               {isConnecting && (
                 <div className="absolute inset-0 bg-nexus-bg flex flex-col items-center justify-center gap-3 z-10">
                   <div className="w-8 h-8 border-[3px] border-nexus-border border-t-nexus-accent rounded-full animate-spin" />
@@ -1757,9 +1824,98 @@ export default function Terminal({ token }: Props) {
               <button className="absolute bottom-3 right-3 w-9 h-9 rounded-full bg-nexus-accent border-none text-white text-lg cursor-pointer z-50 flex items-center justify-center shadow-lg backdrop-blur-sm" onClick={scrollToBottom} title="滚到底部"><Icon name="arrowDown" size={16} /></button>
             )}
           </div>
-          <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={toolbarHeightRef.current} />
-          <div ref={toolbarWrapRef}><Toolbar {...toolbarProps} /></div>
+          <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={(keyboardVisible ? INPUT_BAR_HEIGHT : toolbarHeightRef.current)} />
+          {imePreviewBar}
+          {!keyboardVisible && (
+            <>
+              {/* 28px compact bar — 无键盘时手机常态显示 */}
+              <div ref={toolbarWrapRef} style={{
+                height: INPUT_BAR_HEIGHT,
+                flexShrink: 0,
+                background: 'var(--nexus-bg)',
+                borderTop: '1px solid var(--nexus-border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                padding: '0 8px',
+                gap: 8,
+              }}>
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setMobileToolbarOpen(v => !v) }}
+                  style={{
+                    width: 34,
+                    height: 24,
+                    borderRadius: 6,
+                    border: '1px solid var(--nexus-border)',
+                    background: mobileToolbarOpen ? 'var(--nexus-accent)' : 'var(--nexus-bg2)',
+                    color: mobileToolbarOpen ? '#fff' : 'var(--nexus-text)',
+                    fontSize: 13,
+                    fontFamily: 'inherit',
+                  }}
+                  aria-label="展开工具栏"
+                >⌘</button>
+              </div>
+              {/* 展开完整 Toolbar 浮层 */}
+              {mobileToolbarOpen && (
+                <>
+                  <div className="fixed inset-0 z-[250]" onPointerDown={() => setMobileToolbarOpen(false)} />
+                  <div
+                    className="fixed left-0 right-0 z-[260] shadow-[0_-4px_18px_rgba(0,0,0,0.28)]"
+                    style={{ bottom: INPUT_BAR_HEIGHT }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <Toolbar {...toolbarProps} collapsed={false} onCollapsedChange={() => {}} />
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {/* 移动端 Channel 指示器：右侧竖排可点击小圆点 */}
+          {!isWidePC && windows.length > 0 && (
+            <div className="fixed right-1.5 top-1/2 -translate-y-1/2 z-20 flex flex-col gap-2">
+              {windows.map(win => {
+                const status = getWindowStatus(windowOutputs[win.index])
+                const isActive = win.index === activeWindowIndex
+                return (
+                  <button
+                    key={win.index}
+                    onClick={() => attachToWindow(win.index)}
+                    className="flex items-center justify-center w-7 h-7 p-0 bg-transparent border-2 rounded-full cursor-pointer transition-all duration-100 active:scale-90"
+                    style={{
+                      borderColor: isActive ? 'var(--nexus-accent)' : STATUS_DOT_COLOR[status],
+                      background: isActive ? STATUS_DOT_COLOR[status] : 'transparent',
+                      touchAction: 'manipulation',
+                    }}
+                    aria-label={win.name}
+                    title={win.name}
+                  />
+                )
+              })}
+              {/* + 按钮：快速新建默认 claude channel */}
+              <button
+                onClick={() => createWindow('claude')}
+                className="flex items-center justify-center w-7 h-7 p-0 bg-transparent border border-nexus-border rounded-full cursor-pointer transition-all duration-100 active:scale-90 text-nexus-text-2 hover:text-nexus-text hover:border-nexus-accent"
+                style={{ touchAction: 'manipulation', fontSize: 20, lineHeight: 1 }}
+                aria-label="新建 channel"
+                title="新建 channel"
+              >+</button>
+            </div>
+          )}
         </div>
+      )}
+
+      {keyboardVisible && showKeyboardShortcuts && !isWidePC && (
+        <>
+          <div className="fixed inset-0 z-[250]" onPointerDown={() => setShowKeyboardShortcuts(false)} />
+          <div
+            className="fixed left-0 right-0 z-[260] shadow-[0_-4px_18px_rgba(0,0,0,0.28)]"
+            style={{ bottom: INPUT_BAR_HEIGHT }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <Toolbar {...toolbarProps} collapsed={false} onCollapsedChange={() => {}} />
+          </div>
+        </>
       )}
 
       {/* 移动端会话抽屉 */}
@@ -1919,7 +2075,6 @@ export default function Terminal({ token }: Props) {
       {showSettings && (
         <Suspense fallback={null}>
           <SessionManager
-            token={token}
             onClose={() => setShowSettings(false)}
           />
         </Suspense>
@@ -1941,7 +2096,6 @@ export default function Terminal({ token }: Props) {
       {showNewSession && (
         <Suspense fallback={null}>
           <WorkspaceSelector
-            token={token}
             onClose={() => setShowNewSession(false)}
             onConfirm={handleCreateSession}
           />
@@ -1959,7 +2113,6 @@ export default function Terminal({ token }: Props) {
       {showGeneralSettings && (
         <Suspense fallback={null}>
           <GeneralSettings
-            token={token}
             themeMode={themeMode}
             onToggleTheme={toggleTheme}
             onClose={() => setShowGeneralSettings(false)}

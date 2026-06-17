@@ -2,17 +2,12 @@ import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardR
 import { useTranslation } from 'react-i18next'
 import GhostShield from './GhostShield'
 import { Icon } from './icons'
-
-const STORAGE_KEY = 'nexus_token'
+import { apiFetch } from './lib/api'
 
 /** Parse API error response into a user-friendly message.
- *  For 401, clears the token and reloads (auto-logout). */
+ *  Note: 401 is already intercepted centrally by apiFetch (clears token + reloads),
+ *  so this function only handles non-auth error bodies. */
 async function parseApiError(r: Response, fallback?: string): Promise<string> {
-  if (r.status === 401) {
-    localStorage.removeItem(STORAGE_KEY)
-    window.location.reload()
-    return '' // unreachable after reload
-  }
   try {
     const data = await r.json()
     if (data?.error) return data.error
@@ -126,14 +121,14 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
   const [sidebarChannelMenu, setSidebarChannelMenu] = useState<{ channel: Channel; x: number; y: number } | null>(null)
   const [sidebarProjectMenu, setSidebarProjectMenu] = useState<{ project: Project; x: number; y: number } | null>(null)
 
-  const headers = { Authorization: `Bearer ${token}` }
+  // Authorization is injected centrally by apiFetch; components no longer build auth headers.
 
   // --- Data fetching ---
 
   const fetchProjects = useCallback(async () => {
     setLoadingProjects(true)
     try {
-      const r = await fetch('/api/projects', { headers })
+      const r = await apiFetch('/api/projects')
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.loadFailed'))); return }
       setProjects(await r.json())
     } catch (e: unknown) {
@@ -146,7 +141,7 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
   const fetchChannels = useCallback(async (projectName: string, opts?: { silent?: boolean }) => {
     if (!opts?.silent) setLoadingChannels(true)
     try {
-      const r = await fetch(`/api/projects/${encodeURIComponent(projectName)}/channels`, { headers })
+      const r = await apiFetch(`/api/projects/${encodeURIComponent(projectName)}/channels`)
       const data = await r.json()
       setChannels((data as any).channels || [])
     } catch (e: unknown) {
@@ -174,7 +169,7 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
   const handleProjectClick = async (project: Project) => {
     if (project.name === currentProject) return
     try {
-      const r = await fetch(`/api/projects/${encodeURIComponent(project.name)}/activate`, { method: 'POST', headers })
+      const r = await apiFetch(`/api/projects/${encodeURIComponent(project.name)}/activate`, { method: 'POST' })
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.switchFailed'))); return }
       const data = await r.json()
       onSwitchProject(project.name, data.lastChannel)
@@ -185,9 +180,8 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
 
   const doSwitchChannel = async (channel: Channel, shouldClose: boolean) => {
     try {
-      const r = await fetch(`/api/sessions/${channel.index}/attach?session=${encodeURIComponent(currentProject)}`, {
+      const r = await apiFetch(`/api/sessions/${channel.index}/attach?session=${encodeURIComponent(currentProject)}`, {
         method: 'POST',
-        headers,
       })
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.switchFailed'))); return }
       onSwitchChannel(channel.index)
@@ -204,9 +198,9 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
     const newName = window.prompt(`${t('common.rename')} Channel:`, channel.name)
     if (!newName || newName === channel.name) return
     try {
-      const r = await fetch(`/api/sessions/${channel.index}/rename?session=${encodeURIComponent(currentProject)}`, {
+      const r = await apiFetch(`/api/sessions/${channel.index}/rename?session=${encodeURIComponent(currentProject)}`, {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newName }),
       })
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.renameFailed'))); return }
@@ -221,9 +215,8 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
     setLongPressMenu(null)
     setSidebarChannelMenu(null)
     try {
-      const r = await fetch(`/api/sessions/${channel.index}?session=${encodeURIComponent(currentProject)}`, {
+      const r = await apiFetch(`/api/sessions/${channel.index}?session=${encodeURIComponent(currentProject)}`, {
         method: 'DELETE',
-        headers,
       })
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.closeFailed'))); return }
       fetchChannels(currentProject)
@@ -238,9 +231,9 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
     const newName = window.prompt(`${t('common.rename')} Project:`, project.name)
     if (!newName || newName === project.name) return
     try {
-      const r = await fetch(`/api/projects/${encodeURIComponent(project.name)}/rename`, {
+      const r = await apiFetch(`/api/projects/${encodeURIComponent(project.name)}/rename`, {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newName }),
       })
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.renameFailed'))); return }
@@ -255,7 +248,7 @@ export default forwardRef<SessionManagerV2Handle, Props>(function SessionManager
     setProjectMenu(null)
     setSidebarProjectMenu(null)
     try {
-      const r = await fetch(`/api/projects/${encodeURIComponent(project.name)}`, { method: 'DELETE', headers })
+      const r = await apiFetch(`/api/projects/${encodeURIComponent(project.name)}`, { method: 'DELETE' })
       if (!r.ok) { setError(await parseApiError(r, t('sessionMgr.closeFailed'))); return }
       fetchProjects()
       if (project.name === currentProject) {

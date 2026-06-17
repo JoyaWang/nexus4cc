@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { Icon } from './icons'
+import { apiFetch } from './lib/api'
 
 interface FileEntry {
   name: string
@@ -42,7 +43,7 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
   const [error, setError] = useState('')
   const abortRef = useRef<AbortController | null>(null)
 
-  const headers = { Authorization: `Bearer ${token}` }
+  // Authorization injected centrally by apiFetch.
 
   // 初始化：获取 workspaceRoot 和初始路径
   useEffect(() => {
@@ -52,7 +53,7 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
       // 1. 获取服务端配置
       let root = ''
       try {
-        const r = await fetch('/api/config', { headers })
+        const r = await apiFetch('/api/config')
         if (r.ok) {
           const data = await r.json()
           root = data.workspaceRoot || ''
@@ -66,7 +67,7 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
       let targetPath = initialPath
       if (!targetPath && currentSession) {
         try {
-          const r = await fetch(`/api/session-cwd?session=${encodeURIComponent(currentSession)}`, { headers })
+          const r = await apiFetch(`/api/session-cwd?session=${encodeURIComponent(currentSession)}`)
           if (r.ok) {
             const data = await r.json()
             targetPath = data?.cwd || root || '/'
@@ -139,8 +140,7 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     setSizesReady(false)
     setSelectedName(null) // 切换目录时清除选中
     try {
-      const r = await fetch(`/api/workspace/files?path=${encodeURIComponent(path)}`, {
-        headers,
+      const r = await apiFetch(`/api/workspace/files?path=${encodeURIComponent(path)}`, {
         signal: ctrl.signal,
       })
       if (!r.ok) throw new Error(await r.text())
@@ -183,7 +183,7 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
   const loadPickerEntries = useCallback(async (path: string) => {
     setPickerLoading(true)
     try {
-      const r = await fetch(`/api/workspace/files?path=${encodeURIComponent(path)}`, { headers })
+      const r = await apiFetch(`/api/workspace/files?path=${encodeURIComponent(path)}`)
       if (!r.ok) throw new Error(await r.text())
       const data = await r.json()
       const dirs = (data.entries || []).filter((e: FileEntry) => e.type === 'dir')
@@ -216,9 +216,9 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     setIsRenaming(true)
     setRenameError('')
     try {
-      const r = await fetch('/api/workspace/rename', {
+      const r = await apiFetch('/api/workspace/rename', {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: getEntryPath(renameTarget.name), newName: renameName.trim() }),
       })
       if (!r.ok) {
@@ -240,9 +240,9 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
   async function deleteEntry(entry: FileEntry) {
     if (!confirm(t('workspace.deleteConfirm', { name: entry.name }))) return
     try {
-      const r = await fetch('/api/workspace/entry', {
+      const r = await apiFetch('/api/workspace/entry', {
         method: 'DELETE',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: getEntryPath(entry.name) }),
       })
       if (r.ok && currentPath) {
@@ -291,9 +291,9 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     const targetPath = pickerPath.endsWith('/') ? `${pickerPath}${pickerSource.name}` : `${pickerPath}/${pickerSource.name}`
     const sourcePath = getEntryPath(pickerSource.name)
     try {
-      const r = await fetch(`/api/workspace/${pickerMode}`, {
+      const r = await apiFetch(`/api/workspace/${pickerMode}`, {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sourcePath, targetPath }),
       })
       if (!r.ok) {
@@ -372,9 +372,9 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     setIsCreating(true)
     setNewItemError('')
     try {
-      const r = await fetch('/api/workspace/mkdir', {
+      const r = await apiFetch('/api/workspace/mkdir', {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: currentPath, name: newItemName.trim() }),
       })
       if (!r.ok) {
@@ -397,9 +397,9 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     setIsCreating(true)
     setNewItemError('')
     try {
-      const r = await fetch('/api/workspace/files', {
+      const r = await apiFetch('/api/workspace/files', {
         method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: currentPath, name: newItemName.trim(), content: '' }),
       })
       if (!r.ok) {
@@ -421,7 +421,7 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     if (!currentPath) return
     const filePath = currentPath.endsWith('/') ? `${currentPath}${name}` : `${currentPath}/${name}`
     try {
-      const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(filePath)}`, { headers })
+      const r = await apiFetch(`/api/workspace/file?path=${encodeURIComponent(filePath)}`)
       if (!r.ok) throw new Error('Failed to load file')
       const data = await r.json()
       setEditingFile({ name, path: filePath, content: data.content })
@@ -437,9 +437,9 @@ export default function WorkspaceBrowser({ token, onClose, initialPath = '', cur
     if (!editingFile) return
     setIsSaving(true)
     try {
-      const r = await fetch('/api/workspace/file', {
+      const r = await apiFetch('/api/workspace/file', {
         method: 'PUT',
-        headers: { ...headers, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: editingFile.path, content: editorContent }),
       })
       if (!r.ok) throw new Error('Failed to save file')

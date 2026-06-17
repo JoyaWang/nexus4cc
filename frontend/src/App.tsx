@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import Terminal from './Terminal'
-
-const STORAGE_KEY = 'nexus_token'
+import { STORAGE_KEY } from './lib/api'
 
 export default function App() {
   const { t } = useTranslation()

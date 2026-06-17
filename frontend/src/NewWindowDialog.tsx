@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import GhostShield from './GhostShield'
 import { Icon } from './icons'
+import { apiFetch } from './lib/api'
 
 interface Config {
   id: string
@@ -21,7 +22,7 @@ export default function NewWindowDialog({ token, onClose, onConfirm }: Props) {
   const [selectedProfile, setSelectedProfile] = useState<string>(() => localStorage.getItem('nexus_last_profile') || '')
 
   useEffect(() => {
-    fetch('/api/configs', { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch('/api/configs')
       .then(r => r.ok ? r.json() : [])
       .then((data: Config[]) => {
         setConfigs(data)

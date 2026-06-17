@@ -231,7 +231,6 @@ data/
 nexus/
 ├── server.js              # 唯一后端（ESM，Node 20）
 ├── package.json           # 依赖：express ws node-pty bcrypt
-├── ecosystem.config.cjs   # PM2 配置（当前部署方式）
 ├── start.sh               # 手动启动脚本
 ├── nexus-run-claude.sh    # claude 会话启动脚本（server.js 调用）
 ├── frontend/
@@ -256,6 +255,21 @@ nexus/
 | `TELEGRAM_BOT_TOKEN` | | — | Telegram Bot token（可选） |
 | `TELEGRAM_CHAT_ID` | | — | 允许的 Telegram chat ID（可选） |
 | `CLAUDE_PROXY` | | — | HTTP/HTTPS/ALL proxy for claude CLI（可选） |
+
+### 进程守护（本机生产部署）
+
+本机生产实例由 **launchd** 守护，**不是 PM2**：
+
+- plist: `~/Library/LaunchAgents/com.joya.nexus4cc.plist`（`KeepAlive=true`）
+- wrapper: `/Users/joya/bin/nexus4cc-run.sh` → `exec node server.js`
+- 日志: `~/.nexus4cc.out.log` / `~/.nexus4cc.err.log`
+- 操作: `launchctl kickstart -k gui/$(id -u)/com.joya.nexus4cc`（重启）
+
+> ⚠️ **切勿同时用 PM2 和 launchd 守护同一实例。** 历史上本机曾两套并存，
+> 导致抢同一端口（59000）的 EADDRINUSE 风暴，PM2 实例崩溃重启上百万次，
+> 用户实际连到 launchd 的旧僵尸进程（跑旧代码）。`ecosystem.config.cjs`
+> 已因此删除。新机器用 `scripts/setup.js` 走 PM2 是通用安装路径，但本机
+> 一旦切到 launchd，就不要再 `pm2 start`。
 
 ---
 
