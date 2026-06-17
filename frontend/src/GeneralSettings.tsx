@@ -2,9 +2,9 @@ import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import GhostShield from './GhostShield'
 import { Icon } from './icons'
+import { apiFetch } from './lib/api'
 
 interface Props {
-  token: string
   themeMode: 'dark' | 'light'
   onToggleTheme: () => void
   onClose: () => void
@@ -20,7 +20,7 @@ const UPDATE_CMD = 'git pull && cd frontend && npm run build && cd .. && pm2 res
 
 type UpdateStatus = 'idle' | 'checking' | 'upToDate' | 'available' | 'dirty' | 'error'
 
-export default function GeneralSettings({ token, themeMode, onToggleTheme, onClose, onOpenApiConfig }: Props) {
+export default function GeneralSettings({ themeMode, onToggleTheme, onClose, onOpenApiConfig }: Props) {
   const { t, i18n } = useTranslation()
   const [currentVersion, setCurrentVersion] = useState<string>('')
   const [latestVersion, setLatestVersion] = useState<string>('')
@@ -29,21 +29,21 @@ export default function GeneralSettings({ token, themeMode, onToggleTheme, onClo
   const [copied, setCopied] = useState(false)
 
   useEffect(() => {
-    fetch('/api/version', { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch('/api/version')
       .then(r => r.ok ? r.json() : null)
       .then(data => { if (data?.current) setCurrentVersion(data.current) })
       .catch(() => {})
-  }, [token])
+  }, [])
 
   async function handleCheckUpdate() {
     setUpdateStatus('checking')
     try {
-      const lRes = await fetch('/api/version/latest', { headers: { Authorization: `Bearer ${token}` } })
+      const lRes = await apiFetch('/api/version/latest')
       if (!lRes.ok) { setUpdateStatus('error'); return }
       const lData = await lRes.json()
       if (lData.error) { setUpdateStatus('error'); return }
       // Re-fetch current version to get fresh clean state at check time
-      const vRes = await fetch('/api/version', { headers: { Authorization: `Bearer ${token}` } })
+      const vRes = await apiFetch('/api/version')
       if (!vRes.ok) { setUpdateStatus('error'); return }
       const vData = await vRes.json()
       setCurrentVersion(vData.current)

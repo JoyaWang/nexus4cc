@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Icon } from './icons'
+import { apiFetch } from './lib/api'
 
 type SortKey = 'name' | 'modified' | 'size'
 
@@ -72,9 +73,7 @@ export default function FilePanel({ token, session, onClose }: Props) {
 
   const fetchFiles = useCallback(async () => {
     try {
-      const r = await fetch(`/api/files?session=${encodeURIComponent(session)}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      })
+      const r = await apiFetch(`/api/files?session=${encodeURIComponent(session)}`)
       if (r.ok) {
         const data = await r.json()
         setGroups(data)
@@ -135,9 +134,8 @@ export default function FilePanel({ token, session, onClose }: Props) {
   async function deleteFile(fullPath: string, filename: string) {
     if (!confirm(t('files.deleteConfirm', { filename }))) return
     try {
-      const r = await fetch(`/api/files/content?path=${encodeURIComponent(fullPath)}`, {
+      const r = await apiFetch(`/api/files/content?path=${encodeURIComponent(fullPath)}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
       })
       if (r.ok) {
         fetchFiles()
@@ -150,9 +148,8 @@ export default function FilePanel({ token, session, onClose }: Props) {
   async function deleteAllFiles() {
     if (!confirm(t('files.deleteAllConfirm', { count: totalFiles }))) return
     try {
-      const r = await fetch(`/api/files/all?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/files/all?session=${encodeURIComponent(session)}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
       })
       if (r.ok) {
         fetchFiles()

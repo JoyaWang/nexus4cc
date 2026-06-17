@@ -7,6 +7,8 @@ import { Icon } from './icons'
 import type { Terminal } from '@xterm/xterm'
 import { KeyDef, ToolbarConfig, ALL_KEYS, FACTORY_CONFIG } from './toolbarDefaults'
 import type { ThemeMode } from './Terminal'
+import { shouldUseNativeFileLabel } from './uploadTriggerPolicy'
+import { apiFetch } from './lib/api'
 
 interface Props {
   token: string
@@ -107,6 +109,7 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
   const menuBtnRef                    = useRef<HTMLButtonElement>(null)
   const uploadBtnRef                  = useRef<HTMLButtonElement>(null)
   const [isPC, setIsPC]               = useState(false)
+  const [isTouchDevice, setIsTouchDevice] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
   const editScrollRef = useRef<HTMLDivElement>(null)
   const isDraggingMouse = useRef(false)
@@ -120,6 +123,7 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
   useEffect(() => {
     const checkWidth = () => {
       setIsPC(window.innerWidth >= PC_BREAKPOINT)
+      setIsTouchDevice('ontouchstart' in window || navigator.maxTouchPoints > 0)
     }
     checkWidth()
     window.addEventListener('resize', checkWidth)
@@ -128,7 +132,7 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
 
   // 启动时从服务端拉取配置，覆盖 localStorage 缓存
   useEffect(() => {
-    fetch('/api/toolbar-config', { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch('/api/toolbar-config')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (data && data.pinned && data.expanded) {
@@ -147,7 +151,9 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
     const el = rootRef.current
     if (!el) return
     const prevent = (e: TouchEvent) => {
-      if (editScrollRef.current?.contains(e.target as Node)) return
+      const target = e.target as HTMLElement
+      if (editScrollRef.current?.contains(target)) return
+      if (target.closest('[data-native-file-trigger="true"]')) return
       e.preventDefault()
     }
     el.addEventListener('touchstart', prevent, { passive: false })
@@ -179,9 +185,9 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
 
   function saveConfig(c: ToolbarConfig) {
     localStorage.setItem(CONFIG_KEY, JSON.stringify(c))
-    fetch('/api/toolbar-config', {
+    apiFetch('/api/toolbar-config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(c),
     }).catch(() => {})
   }
@@ -293,6 +299,27 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
 
   const usedIds = new Set([...config.pinned, ...config.expanded])
   const availableKeys = ALL_KEYS.filter(k => !usedIds.has(k.id))
+  const useNativeFileLabel = shouldUseNativeFileLabel({ isTouch: isTouchDevice })
+
+  function renderNativeFileLabel(kind: 'photos' | 'files') {
+    const isPhotos = kind === 'photos'
+    return (
+      <label className={`${quickMenuItemClass} relative`} data-native-file-trigger="true">
+        <Icon name={isPhotos ? 'image' : 'folder'} size={16} />
+        <span>{isPhotos ? t('toolbar.photos') : t('toolbar.files')}</span>
+        <input
+          type="file"
+          accept={isPhotos ? 'image/*,video/*' : '*/*'}
+          className="absolute inset-0 opacity-0 w-full h-full cursor-pointer"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (file && onUploadFile) { onUploadFile(file); setShowUploadMenu(false) }
+            e.target.value = ''
+          }}
+        />
+      </label>
+    )
+  }
 
   // ---- 渲染按键 ----
   function renderKeys(ids: string[]) {
@@ -644,14 +671,18 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
               <GhostShield />
               <div className="fixed inset-0 z-[300]" onPointerDown={() => setShowUploadMenu(false)} />
               <div className="fixed bg-nexus-menu-bg border border-nexus-border rounded-lg py-1 min-w-[120px] z-[400] shadow-[0_4px_16px_rgba(0,0,0,0.3)]" style={{ bottom: uploadMenuPos.bottom, right: uploadMenuPos.right }}>
-                <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); fileInputRef.current?.click(); setShowUploadMenu(false) }}>
-                  <Icon name="image" size={16} />
-                  <span>{t('toolbar.photos')}</span>
-                </button>
-                <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); pasteFileRef.current?.click(); setShowUploadMenu(false) }}>
-                  <Icon name="folder" size={16} />
-                  <span>{t('toolbar.files')}</span>
-                </button>
+                {useNativeFileLabel ? renderNativeFileLabel('photos') : (
+                  <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); fileInputRef.current?.click(); setShowUploadMenu(false) }}>
+                    <Icon name="image" size={16} />
+                    <span>{t('toolbar.photos')}</span>
+                  </button>
+                )}
+                {useNativeFileLabel ? renderNativeFileLabel('files') : (
+                  <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); pasteFileRef.current?.click(); setShowUploadMenu(false) }}>
+                    <Icon name="folder" size={16} />
+                    <span>{t('toolbar.files')}</span>
+                  </button>
+                )}
               </div>
             </>,
             document.body
@@ -726,14 +757,18 @@ export default function Toolbar({ token, sendToWs, scrollToBottom, termRef: _ter
             <GhostShield />
             <div className="fixed inset-0 z-[300]" onPointerDown={() => setShowUploadMenu(false)} />
             <div className="fixed bg-nexus-menu-bg border border-nexus-border rounded-lg py-1 min-w-[120px] z-[400] shadow-[0_-4px_16px_rgba(0,0,0,0.3)]" style={{ bottom: uploadMenuPos.bottom, right: uploadMenuPos.right }}>
-              <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); fileInputRef.current?.click(); setShowUploadMenu(false) }}>
-                <Icon name="image" size={16} />
-                <span>{t('toolbar.photos')}</span>
-              </button>
-              <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); pasteFileRef.current?.click(); setShowUploadMenu(false) }}>
-                <Icon name="folder" size={16} />
-                <span>{t('toolbar.files')}</span>
-              </button>
+              {useNativeFileLabel ? renderNativeFileLabel('photos') : (
+                <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); fileInputRef.current?.click(); setShowUploadMenu(false) }}>
+                  <Icon name="image" size={16} />
+                  <span>{t('toolbar.photos')}</span>
+                </button>
+              )}
+              {useNativeFileLabel ? renderNativeFileLabel('files') : (
+                <button className={quickMenuItemClass} onPointerDown={(e) => { e.preventDefault(); pasteFileRef.current?.click(); setShowUploadMenu(false) }}>
+                  <Icon name="folder" size={16} />
+                  <span>{t('toolbar.files')}</span>
+                </button>
+              )}
             </div>
           </>,
           document.body

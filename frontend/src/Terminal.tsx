@@ -13,6 +13,7 @@ import SessionFAB from './SessionFAB'
 import GhostShield from './GhostShield'
 import { Icon } from './icons'
 import { getWindowStatus, STATUS_DOT_COLOR, STATUS_DOT_TITLE } from './windowStatus'
+import { apiFetch, handleAuthFailure } from './lib/api'
 
 // ANSI 256-color palette (0-15 standard, 16-231 6x6x6 cube, 232-255 grayscale)
 const ANSI256: string[] = (() => {
@@ -292,7 +293,7 @@ export default function Terminal({ token }: Props) {
 
   // 加载服务端默认 session
   useEffect(() => {
-    fetch('/api/config', { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch('/api/config')
       .then(r => r.json())
       .then(d => {
         if (d.tmuxSession && !localStorage.getItem('nexus_session')) {
@@ -307,7 +308,7 @@ export default function Terminal({ token }: Props) {
   useEffect(() => {
     const fetchSessions = async () => {
       try {
-        const r = await fetch('/api/tmux-sessions', { headers: { Authorization: `Bearer ${token}` } })
+        const r = await apiFetch('/api/tmux-sessions')
         if (r.ok) {
           const sessions = await r.json()
           setTmuxSessions(sessions.map((s: any) => s.name))
@@ -316,7 +317,7 @@ export default function Terminal({ token }: Props) {
     }
     const fetchProjects = async () => {
       try {
-        const r = await fetch('/api/projects', { headers: { Authorization: `Bearer ${token}` } })
+        const r = await apiFetch('/api/projects')
         if (r.ok) {
           setProjects(await r.json())
         }
@@ -443,7 +444,7 @@ export default function Terminal({ token }: Props) {
       const outputs: Record<number, any> = {}
       for (const win of windows) {
         try {
-          const r = await fetch(`/api/sessions/${win.index}/output?session=${encodeURIComponent(activeTmuxSession)}`, { headers: { Authorization: `Bearer ${token}` } })
+          const r = await apiFetch(`/api/sessions/${win.index}/output?session=${encodeURIComponent(activeTmuxSession)}`)
           if (r.ok) outputs[win.index] = await r.json()
         } catch {}
       }
@@ -488,9 +489,8 @@ export default function Terminal({ token }: Props) {
     if (scrollbackCacheRef.current[key] !== undefined || scrollbackPrefetchRef.current[key]) {
       return scrollbackPrefetchRef.current[key]
     }
-    const promise = fetch(`/api/sessions/${windowIndex}/scrollback?session=${encodeURIComponent(session)}&lines=3000`, {
-      headers: { Authorization: `Bearer ${token}` },
-    }).then(r => r.ok ? r.json() : Promise.reject(r.status))
+    const promise = apiFetch(`/api/sessions/${windowIndex}/scrollback?session=${encodeURIComponent(session)}&lines=3000`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then((data: { content: string }) => {
         scrollbackCacheRef.current[key] = data.content.trimEnd()
         delete scrollbackPrefetchRef.current[key]
@@ -572,7 +572,7 @@ export default function Terminal({ token }: Props) {
   async function fetchWindows() {
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions?session=${encodeURIComponent(session)}`, { headers: { Authorization: `Bearer ${token}` } })
+      const r = await apiFetch(`/api/sessions?session=${encodeURIComponent(session)}`)
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const d = await r.json()
       const wins = d.windows ?? []
@@ -621,9 +621,8 @@ export default function Terminal({ token }: Props) {
 
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions/${index}/attach?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/sessions/${index}/attach?session=${encodeURIComponent(session)}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
       })
       if (r.ok) {
         setActiveWindowIndex(index)
@@ -647,9 +646,8 @@ export default function Terminal({ token }: Props) {
   async function closeWindow(index: number) {
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions/${index}?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/sessions/${index}?session=${encodeURIComponent(session)}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
       })
       if (r.ok) {
         await fetchWindows()
@@ -662,9 +660,9 @@ export default function Terminal({ token }: Props) {
   async function renameWindow(index: number, name: string) {
     try {
       const session = activeTmuxSessionRef.current
-      const r = await fetch(`/api/sessions/${index}/rename?session=${encodeURIComponent(session)}`, {
+      const r = await apiFetch(`/api/sessions/${index}/rename?session=${encodeURIComponent(session)}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
       })
       if (r.ok) {
@@ -678,9 +676,9 @@ export default function Terminal({ token }: Props) {
   async function createSession(relPath: string, shellType: 'claude' | 'bash' = 'claude', profile?: string) {
     try {
       // F-20: 使用 /api/projects 创建新的 project（tmux session）
-      const r = await fetch('/api/projects', {
+      const r = await apiFetch('/api/projects', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: relPath, shell_type: shellType, profile }),
       })
       if (r.ok) {
@@ -701,18 +699,16 @@ export default function Terminal({ token }: Props) {
       const currentProject = projects.find(p => p.name === session)
       const projectPath = currentProject?.path
       // 修复：使用正确的 API 端点 /api/projects/:name/channels
-      const r = await fetch(`/api/projects/${encodeURIComponent(session)}/channels`, {
+      const r = await apiFetch(`/api/projects/${encodeURIComponent(session)}/channels`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shell_type: shellType, profile, path: projectPath }),
       })
       if (r.ok) {
         const { name: newWindowName } = await r.json()
         await new Promise(resolve => setTimeout(resolve, 300))
         const sessionNow = activeTmuxSessionRef.current
-        const listRes = await fetch(`/api/sessions?session=${encodeURIComponent(sessionNow)}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        })
+        const listRes = await apiFetch(`/api/sessions?session=${encodeURIComponent(sessionNow)}`)
         if (listRes.ok) {
           const d = await listRes.json()
           const wins: TmuxWindow[] = d.windows ?? []
@@ -782,9 +778,8 @@ export default function Terminal({ token }: Props) {
     try {
       const sessionParam = `session=${encodeURIComponent(activeTmuxSessionRef.current)}`
       const url = overwrite ? `/api/files/upload?overwrite=1&${sessionParam}` : `/api/files/upload?${sessionParam}`
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
         body: formData,
       })
       if (res.status === 409) {
@@ -803,6 +798,14 @@ export default function Terminal({ token }: Props) {
       if (term) {
         term.writeln(`\r\n\x1b[32m[Nexus: 文件已上传]\x1b[0m ${filename}`)
         if (fullPath) term.writeln(`\x1b[36m路径: ${fullPath}\x1b[0m`)
+      }
+      // 上传成功后自动注入 prompt 到终端输入行（不自动回车）
+      if (fullPath) {
+        const isImageVideo = file.type.startsWith('image/') || file.type.startsWith('video/')
+        const prompt = isImageVideo
+          ? `请读取并分析这张图片：${fullPath} `
+          : `请读取这个文件：${fullPath} `
+        sendToWs(prompt)
       }
     } catch (e: any) {
       console.error('Upload failed:', e)
@@ -1346,7 +1349,8 @@ export default function Terminal({ token }: Props) {
       newWs.onclose = (e) => {
         if (intentionalClose) return
         if (e.code === 4001) {
-          writeTerm('\r\n\x1b[31m[Nexus: 认证失败，请刷新重新登录]\x1b[0m\r\n')
+          writeTerm('\r\n\x1b[31m[Nexus: 登录已过期，正在返回登录页...]\x1b[0m\r\n')
+          handleAuthFailure()
           return
         }
         if (reconnectAttempts >= maxReconnectAttempts) {
@@ -1414,6 +1418,8 @@ export default function Terminal({ token }: Props) {
   const [keyboardVisible, setKeyboardVisible] = useState(false)
   const [compositionText, setCompositionText] = useState('')
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false)
+  // 移动端无键盘时 compact bar 展开状态
+  const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false)
   const maxViewportHeightRef = useRef(typeof window !== 'undefined' ? window.innerHeight : 0)
   // 文件上传覆盖确认对话框状态
   const [uploadConflict, setUploadConflict] = useState<{ show: boolean; file: File | null; filename: string }>({ show: false, file: null, filename: '' })
@@ -1820,7 +1826,82 @@ export default function Terminal({ token }: Props) {
           </div>
           <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={(keyboardVisible ? INPUT_BAR_HEIGHT : toolbarHeightRef.current)} />
           {imePreviewBar}
-          {!keyboardVisible && <div ref={toolbarWrapRef}><Toolbar {...toolbarProps} /></div>}
+          {!keyboardVisible && (
+            <>
+              {/* 28px compact bar — 无键盘时手机常态显示 */}
+              <div ref={toolbarWrapRef} style={{
+                height: INPUT_BAR_HEIGHT,
+                flexShrink: 0,
+                background: 'var(--nexus-bg)',
+                borderTop: '1px solid var(--nexus-border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                padding: '0 8px',
+                gap: 8,
+              }}>
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setMobileToolbarOpen(v => !v) }}
+                  style={{
+                    width: 34,
+                    height: 24,
+                    borderRadius: 6,
+                    border: '1px solid var(--nexus-border)',
+                    background: mobileToolbarOpen ? 'var(--nexus-accent)' : 'var(--nexus-bg2)',
+                    color: mobileToolbarOpen ? '#fff' : 'var(--nexus-text)',
+                    fontSize: 13,
+                    fontFamily: 'inherit',
+                  }}
+                  aria-label="展开工具栏"
+                >⌘</button>
+              </div>
+              {/* 展开完整 Toolbar 浮层 */}
+              {mobileToolbarOpen && (
+                <>
+                  <div className="fixed inset-0 z-[250]" onPointerDown={() => setMobileToolbarOpen(false)} />
+                  <div
+                    className="fixed left-0 right-0 z-[260] shadow-[0_-4px_18px_rgba(0,0,0,0.28)]"
+                    style={{ bottom: INPUT_BAR_HEIGHT }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <Toolbar {...toolbarProps} collapsed={false} onCollapsedChange={() => {}} />
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {/* 移动端 Channel 指示器：右侧竖排可点击小圆点 */}
+          {!isWidePC && windows.length > 0 && (
+            <div className="fixed right-1.5 top-1/2 -translate-y-1/2 z-20 flex flex-col gap-2">
+              {windows.map(win => {
+                const status = getWindowStatus(windowOutputs[win.index])
+                const isActive = win.index === activeWindowIndex
+                return (
+                  <button
+                    key={win.index}
+                    onClick={() => attachToWindow(win.index)}
+                    className="flex items-center justify-center w-7 h-7 p-0 bg-transparent border-2 rounded-full cursor-pointer transition-all duration-100 active:scale-90"
+                    style={{
+                      borderColor: isActive ? 'var(--nexus-accent)' : STATUS_DOT_COLOR[status],
+                      background: isActive ? STATUS_DOT_COLOR[status] : 'transparent',
+                      touchAction: 'manipulation',
+                    }}
+                    aria-label={win.name}
+                    title={win.name}
+                  />
+                )
+              })}
+              {/* + 按钮：快速新建默认 claude channel */}
+              <button
+                onClick={() => createWindow('claude')}
+                className="flex items-center justify-center w-7 h-7 p-0 bg-transparent border border-nexus-border rounded-full cursor-pointer transition-all duration-100 active:scale-90 text-nexus-text-2 hover:text-nexus-text hover:border-nexus-accent"
+                style={{ touchAction: 'manipulation', fontSize: 20, lineHeight: 1 }}
+                aria-label="新建 channel"
+                title="新建 channel"
+              >+</button>
+            </div>
+          )}
         </div>
       )}
 
@@ -1994,7 +2075,6 @@ export default function Terminal({ token }: Props) {
       {showSettings && (
         <Suspense fallback={null}>
           <SessionManager
-            token={token}
             onClose={() => setShowSettings(false)}
           />
         </Suspense>
@@ -2016,7 +2096,6 @@ export default function Terminal({ token }: Props) {
       {showNewSession && (
         <Suspense fallback={null}>
           <WorkspaceSelector
-            token={token}
             onClose={() => setShowNewSession(false)}
             onConfirm={handleCreateSession}
           />
@@ -2034,7 +2113,6 @@ export default function Terminal({ token }: Props) {
       {showGeneralSettings && (
         <Suspense fallback={null}>
           <GeneralSettings
-            token={token}
             themeMode={themeMode}
             onToggleTheme={toggleTheme}
             onClose={() => setShowGeneralSettings(false)}
