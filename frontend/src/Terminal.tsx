@@ -1,9 +1,6 @@
 import { useEffect, useRef, useCallback, useState, lazy, Suspense } from 'react'
 import type { SessionManagerV2Handle } from './SessionManagerV2'
 import { useTranslation } from 'react-i18next'
-import { mapSpecialKey, shouldSkipInput } from './mobileInput'
-import { detectKeyboardVisible } from './viewportKeyboard'
-import { scrollbackKey } from './scrollbackCachePolicy'
 import { Terminal as XTerm, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -120,7 +117,6 @@ const THEME_KEY = 'nexus_theme'
 const WINDOW_KEY = 'nexus_window'
 const TAP_THRESHOLD = 8
 const MAX_UPLOAD_NOTIFICATIONS = 5
-const INPUT_BAR_HEIGHT = 28
 
 export type ThemeMode = 'dark' | 'light'
 
@@ -237,8 +233,8 @@ export default function Terminal({ token }: Props) {
   const swipeUpAccumRef = useRef(0)
   const scrollbackOverlayRef = useRef<HTMLDivElement>(null)
   const triggerScrollbackRef = useRef<() => void>(() => {})
-  const scrollbackPrefetchRef = useRef<Record<string, Promise<{ content: string }> | undefined>>({})
-  const scrollbackCacheRef = useRef<Record<string, string>>({})
+  const scrollbackPrefetchRef = useRef<Promise<{ content: string }> | null>(null)
+  const scrollbackCacheRef = useRef<string | null>(null)
   const pausePollingRef = useRef(false)
   const activeWindowIndexRef = useRef(0)
   const windowsInitializedRef = useRef(false)
@@ -247,6 +243,22 @@ export default function Terminal({ token }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const pasteFileRef = useRef<HTMLInputElement>(null)
   const uploadFileRef = useRef<(file: File) => Promise<void>>(null!)
+  // Upload queue: multi-file concurrent upload with progress
+  type UploadStatus = 'pending' | 'uploading' | 'done' | 'error' | 'conflict'
+  interface UploadItem {
+    id: string
+    file: File
+    status: UploadStatus
+    progress: number
+    error?: string
+    fullPath?: string
+    filename?: string
+    xhr?: XMLHttpRequest
+  }
+  const MAX_CONCURRENT_UPLOADS = 3
+  const [uploadQueue, setUploadQueue] = useState<UploadItem[]>([])
+  const uploadQueueRef = useRef(uploadQueue)
+  uploadQueueRef.current = uploadQueue
   const [windowOutputs, setWindowOutputs] = useState<Record<number, { output: string; clients: number; idleMs: number; connected: boolean }>>({})
     const scrollPositionsRef = useRef<Record<number, number>>({})
   const windowsRef = useRef<TmuxWindow[]>([])
@@ -483,26 +495,6 @@ export default function Terminal({ token }: Props) {
       })
     }, 150)
   }, [])
-
-  function prefetchScrollback(windowIndex = activeWindowIndexRef.current, session = activeTmuxSessionRef.current) {
-    const key = scrollbackKey(session, windowIndex)
-    if (scrollbackCacheRef.current[key] !== undefined || scrollbackPrefetchRef.current[key]) {
-      return scrollbackPrefetchRef.current[key]
-    }
-    const promise = apiFetch(`/api/sessions/${windowIndex}/scrollback?session=${encodeURIComponent(session)}&lines=3000`)
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then((data: { content: string }) => {
-        scrollbackCacheRef.current[key] = data.content.trimEnd()
-        delete scrollbackPrefetchRef.current[key]
-        return data
-      })
-      .catch(() => {
-        delete scrollbackPrefetchRef.current[key]
-        return { content: '' }
-      })
-    scrollbackPrefetchRef.current[key] = promise
-    return promise
-  }
 
   // 简化的 resize 处理：只在必要时执行，避免过度工程化
   useEffect(() => {
@@ -771,60 +763,153 @@ export default function Terminal({ token }: Props) {
     fileInputRef.current?.click()
   }
 
-  async function uploadFile(file: File, overwrite = false) {
-    const formData = new FormData()
-    formData.append('file', file)
-    formData.append('originalName', file.name)
-    try {
-      const sessionParam = `session=${encodeURIComponent(activeTmuxSessionRef.current)}`
-      const url = overwrite ? `/api/files/upload?overwrite=1&${sessionParam}` : `/api/files/upload?${sessionParam}`
-      const res = await apiFetch(url, {
-        method: 'POST',
-        body: formData,
-      })
-      if (res.status === 409) {
-        // 文件已存在，显示确认对话框
-        const data = await res.json()
-        setUploadConflict({ show: true, file, filename: data.filename || file.name })
+  // ---- Multi-file upload queue with XHR progress ----
+  function updateItem(id: string, patch: Partial<UploadItem>) {
+    setUploadQueue(prev => prev.map(u => u.id === id ? { ...u, ...patch } : u))
+  }
+
+  function removeItem(id: string) {
+    setUploadQueue(prev => prev.filter(u => u.id !== id))
+  }
+
+  function processQueue() {
+    setUploadQueue(prev => {
+      const uploading = prev.filter(u => u.status === 'uploading').length
+      if (uploading >= MAX_CONCURRENT_UPLOADS) return prev
+      const pending = prev.filter(u => u.status === 'pending')
+      if (pending.length === 0) return prev
+      const toStart = pending.slice(0, MAX_CONCURRENT_UPLOADS - uploading)
+      for (const item of toStart) {
+        startUpload(item.id)
+      }
+      return prev.map(u => toStart.some(t => t.id === u.id) ? { ...u, status: 'uploading' as UploadStatus } : u)
+    })
+  }
+
+  function startUpload(id: string, overwrite = false) {
+    const item = uploadQueueRef.current.find(u => u.id === id)
+    if (!item) return
+    const xhr = new XMLHttpRequest()
+    updateItem(id, { xhr })
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        updateItem(id, { progress: Math.round((e.loaded / e.total) * 100) })
+      }
+    }
+
+    xhr.onload = () => {
+      if (xhr.status === 401) {
+        // Token rejected on upload — same recovery as HTTP/WS auth failure.
+        handleAuthFailure()
         return
       }
-      if (!res.ok) throw new Error(await res.text())
-      const data = await res.json()
-      const fullPath = data.fullPath || data.url || ''
-      const filename = data.originalName || data.filename || file.name
-      if (!fullPath) console.warn('[Nexus] Upload response missing fullPath:', data)
-      addUploadNotification(filename, fullPath)
+      if (xhr.status === 409) {
+        try {
+          const data = JSON.parse(xhr.responseText)
+          updateItem(id, { status: 'conflict', filename: data.filename || item.file.name, progress: 0 })
+          setUploadConflict({ show: true, itemId: id, filename: data.filename || item.file.name })
+        } catch {
+          updateItem(id, { status: 'error', error: 'conflict' })
+          processQueue()
+        }
+        return
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText)
+          const fullPath = data.fullPath || data.url || ''
+          const filename = data.filename || data.originalName || item.file.name
+          updateItem(id, { status: 'done', fullPath, filename, progress: 100 })
+          addUploadNotification(filename, fullPath)
+          const term = termRef.current
+          if (term) {
+            term.writeln(`\r\n\x1b[32m[Nexus: 文件已上传]\x1b[0m ${filename}`)
+            if (fullPath) term.writeln(`\x1b[36m路径: ${fullPath}\x1b[0m`)
+          }
+          setTimeout(() => removeItem(id), 3000)
+        } catch {
+          updateItem(id, { status: 'error', error: 'invalid response' })
+        }
+      } else {
+        updateItem(id, { status: 'error', error: xhr.statusText || `HTTP ${xhr.status}` })
+        const term = termRef.current
+        if (term) term.writeln(`\r\n\x1b[31m[Nexus: 上传失败]\x1b[0m ${item.file.name}`)
+      }
+      processQueue()
+    }
+
+    xhr.onerror = () => {
+      updateItem(id, { status: 'error', error: 'network error' })
       const term = termRef.current
-      if (term) {
-        term.writeln(`\r\n\x1b[32m[Nexus: 文件已上传]\x1b[0m ${filename}`)
-        if (fullPath) term.writeln(`\x1b[36m路径: ${fullPath}\x1b[0m`)
-      }
-      // 上传成功后自动注入 prompt 到终端输入行（不自动回车）
-      if (fullPath) {
-        const isImageVideo = file.type.startsWith('image/') || file.type.startsWith('video/')
-        const prompt = isImageVideo
-          ? `请读取并分析这张图片：${fullPath} `
-          : `请读取这个文件：${fullPath} `
-        sendToWs(prompt)
-      }
-    } catch (e: any) {
-      console.error('Upload failed:', e)
-      const term = termRef.current
-      if (term) {
-        term.writeln(`\r\n\x1b[31m[Nexus: 上传失败]\x1b[0m ${e.message || 'unknown error'}`)
-      }
+      if (term) term.writeln(`\r\n\x1b[31m[Nexus: 上传失败]\x1b[0m ${item.file.name}`)
+      processQueue()
+    }
+
+    xhr.onabort = () => {
+      updateItem(id, { status: 'error', error: 'cancelled' })
+      processQueue()
+    }
+
+    const formData = new FormData()
+    formData.append('file', item.file)
+    formData.append('originalName', item.file.name)
+    const sessionParam = `session=${encodeURIComponent(activeTmuxSessionRef.current)}`
+    const url = overwrite
+      ? `/api/files/upload?overwrite=1&${sessionParam}`
+      : `/api/files/upload?${sessionParam}`
+    xhr.open('POST', url)
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.send(formData)
+  }
+
+  function enqueueFiles(files: FileList | null) {
+    if (!files || files.length === 0) return
+    const newItems: UploadItem[] = Array.from(files).map(file => ({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      file,
+      status: 'pending',
+      progress: 0,
+    }))
+    setUploadQueue(prev => [...prev, ...newItems])
+    // defer processQueue to next tick so state is settled
+    setTimeout(processQueue, 0)
+  }
+
+  function cancelUpload(id: string) {
+    const item = uploadQueueRef.current.find(u => u.id === id)
+    if (item?.xhr) {
+      item.xhr.abort()
+    } else {
+      removeItem(id)
+      processQueue()
     }
   }
 
+  // Legacy single-file API (kept for paste/drag handlers that expect it)
+  async function uploadFile(file: File, overwrite = false) {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+    setUploadQueue(prev => [...prev, { id, file, status: 'pending', progress: 0 }])
+    setTimeout(() => startUpload(id, overwrite), 0)
+  }
+
   function handleOverwriteConfirm() {
-    if (uploadConflict.file) {
-      uploadFile(uploadConflict.file, true)
-      setUploadConflict({ show: false, file: null, filename: '' })
+    const id = uploadConflict.itemId
+    if (id) {
+      updateItem(id, { status: 'uploading', progress: 0 })
+      startUpload(id, true)
+      setUploadConflict({ show: false, itemId: null, filename: '' })
     }
   }
 
   function handleOverwriteCancel() {
-    setUploadConflict({ show: false, file: null, filename: '' })
+    const id = uploadConflict.itemId
+    if (id) {
+      updateItem(id, { status: 'error', error: 'skipped' })
+      removeItem(id)
+      processQueue()
+    }
+    setUploadConflict({ show: false, itemId: null, filename: '' })
     const term = termRef.current
     if (term) {
       term.writeln(`\r\n\x1b[33m[Nexus: 上传已取消]\x1b[0m ${uploadConflict.filename}`)
@@ -945,16 +1030,8 @@ export default function Terminal({ token }: Props) {
         // PC Ctrl+C 无选中：继续往下 → 发送 SIGINT (ETX)
       }
 
-      // 粘贴：从剪贴板读取并发送到终端
-      if (clipboardMod && clipboardKey === 'v' && noOtherMod) {
-        e.preventDefault()
-        navigator.clipboard.readText().then(text => {
-          if (text && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(text)
-          }
-        }).catch(() => {})
-        return
-      }
+      // 粘贴：不拦截，让浏览器原生 paste 事件触发 → xterm onData → WebSocket
+      if (clipboardMod && clipboardKey === 'v') return
 
       // 白名单：这些快捷键保留给浏览器/应用使用
       const whitelist = [
@@ -1028,6 +1105,8 @@ export default function Terminal({ token }: Props) {
         // 可打印字符（无修饰键）：让 xterm 处理 → textarea → onData
         // 这样浏览器 IME 才能正常工作
         if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) return true
+        // 剪贴板粘贴：让浏览器原生 paste 事件触发，xterm 的 onData 负责发送到 WS
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return true
         // 特殊键（箭头、Enter、Tab 等）和快捷键：让全局 handler 处理
         return false
       }
@@ -1110,9 +1189,18 @@ export default function Terminal({ token }: Props) {
           touchLastY = y
           if (deltaY < 0) {  // finger DOWN = swipe down = view history
             swipeUpAccumRef.current += -deltaY
-            if (swipeUpAccumRef.current > 10) {
+            if (swipeUpAccumRef.current > 10 && !scrollbackPrefetchRef.current && scrollbackCacheRef.current === null) {
               // Pre-fetch while gesture is still building up
-              prefetchScrollback()
+              const wi = activeWindowIndexRef.current
+              const s = activeTmuxSessionRef.current
+              scrollbackPrefetchRef.current = apiFetch(`/api/sessions/${wi}/scrollback?session=${encodeURIComponent(s)}&lines=3000`)
+                .then(r => r.ok ? r.json() : Promise.reject(r.status))
+                .then((data: { content: string }) => {
+                  scrollbackCacheRef.current = data.content.trimEnd()
+                  scrollbackPrefetchRef.current = null
+                  return data
+                })
+                .catch(() => { scrollbackPrefetchRef.current = null; return { content: '' } })
             }
             if (swipeUpAccumRef.current > 40) {
               triggerScrollbackRef.current()
@@ -1212,7 +1300,7 @@ export default function Terminal({ token }: Props) {
       container.style.boxShadow = ''
       const files = e.dataTransfer?.files
       if (files && files.length > 0) {
-        uploadFileRef.current(files[0])
+        enqueueFiles(files)
       }
     }
     container.addEventListener('dragover', onDragOver)
@@ -1333,16 +1421,10 @@ export default function Terminal({ token }: Props) {
             wsRef.current.send(JSON.stringify({ type: 'resize', cols: termRef.current.cols, rows: termRef.current.rows }))
           }
         })
-        window.setTimeout(() => prefetchScrollback(wi, s), 500)
       }
 
       newWs.onmessage = (e) => {
         writeTerm(e.data)
-        const key = scrollbackKey(activeTmuxSessionRef.current, activeWindowIndexRef.current)
-        delete scrollbackCacheRef.current[key]
-        if (!scrollbackPrefetchRef.current[key]) {
-          window.setTimeout(() => prefetchScrollback(activeWindowIndexRef.current, activeTmuxSessionRef.current), 250)
-        }
         if (!userScrolledRef.current) termRef.current?.scrollToBottom()
       }
 
@@ -1378,31 +1460,38 @@ export default function Terminal({ token }: Props) {
   const isComposingRef = useRef(false)
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const native = e.nativeEvent as InputEvent
-    if (shouldSkipInput({
-      isComposing: native.isComposing,
-      inputType: native.inputType,
-      refFlag: isComposingRef.current,
-    })) {
-      // composition in progress — update preview, don't send
-      setCompositionText(e.target.value)
-      return
-    }
+    if (isComposingRef.current) return // handled by compositionEnd
+    // Fallback for Android (keydown fires key='Unidentified', onChange is reliable there)
     const val = e.target.value
     if (val) { sendToWs(val); e.target.value = '' }
-    setCompositionText('')
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (isComposingRef.current) return
-    const mapped = mapSpecialKey(e.key, e.ctrlKey)
-    if (mapped !== null) {
+    if (e.key === 'Enter') { e.preventDefault(); sendToWs('\r') }
+    else if (e.key === 'Backspace') { e.preventDefault(); sendToWs('\x7f') }
+    else if (e.key === 'Tab') { e.preventDefault(); sendToWs('\t') }
+    else if (e.key === 'Escape') { e.preventDefault(); sendToWs('\x1b') }
+    else if (e.key === 'Delete') { e.preventDefault(); sendToWs('\x1b[3~') }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sendToWs('\x1b[A') }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); sendToWs('\x1b[B') }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); sendToWs('\x1b[C') }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); sendToWs('\x1b[D') }
+    else if (e.key === 'Home') { e.preventDefault(); sendToWs('\x1b[H') }
+    else if (e.key === 'End') { e.preventDefault(); sendToWs('\x1b[F') }
+    else if (e.key === 'PageUp') { e.preventDefault(); sendToWs('\x1b[5~') }
+    else if (e.key === 'PageDown') { e.preventDefault(); sendToWs('\x1b[6~') }
+    else if (e.ctrlKey && e.key.length === 1) {
       e.preventDefault()
-      sendToWs(mapped)
+      sendToWs(String.fromCharCode(e.key.toLowerCase().charCodeAt(0) - 96))
     }
-    // Printable chars, Unidentified, modifier+char combos fall through.
-    // They populate input.value and trigger onChange → handleInputChange,
-    // which is guarded by isComposingRef during IME composition.
+    else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      // Intercept printable chars (letters, digits, punctuation) directly from keydown.
+      // preventDefault stops the browser from updating input.value, so onChange won't
+      // double-fire. This is reliable on iOS/desktop where e.key is always correct.
+      e.preventDefault()
+      sendToWs(e.key)
+    }
   }
 
   function handleCompositionEnd(e: React.CompositionEvent<HTMLInputElement>) {
@@ -1410,38 +1499,22 @@ export default function Terminal({ token }: Props) {
     const text = e.data
     if (text) sendToWs(text)
     ;(e.currentTarget as HTMLInputElement).value = ''
-    setCompositionText('')
   }
 
   // Track keyboard visibility and adjust layout height on mobile
   const [vvHeight, setVvHeight] = useState<number | null>(null)
-  const [keyboardVisible, setKeyboardVisible] = useState(false)
-  const [compositionText, setCompositionText] = useState('')
-  const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false)
-  // 移动端无键盘时 compact bar 展开状态
-  const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false)
-  const maxViewportHeightRef = useRef(typeof window !== 'undefined' ? window.innerHeight : 0)
   // 文件上传覆盖确认对话框状态
-  const [uploadConflict, setUploadConflict] = useState<{ show: boolean; file: File | null; filename: string }>({ show: false, file: null, filename: '' })
+  const [uploadConflict, setUploadConflict] = useState<{ show: boolean; itemId: string | null; filename: string }>({ show: false, itemId: null, filename: '' })
   useEffect(() => {
+    if (isWidePC) {
+      setVvHeight(null)
+      return
+    }
     const vv = window.visualViewport
     if (!vv) return
-    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0
     const handleResize = () => {
-      maxViewportHeightRef.current = Math.max(maxViewportHeightRef.current, vv.height, window.innerHeight)
-      const kbVisible = detectKeyboardVisible({
-        isTouch,
-        viewportHeight: vv.height,
-        maxViewportHeight: maxViewportHeightRef.current,
-      })
-      keyboardVisibleRef.current = kbVisible
-      setKeyboardVisible(kbVisible)
-      if (!kbVisible) setShowKeyboardShortcuts(false)
-      if (!isWidePC || kbVisible) {
-        setVvHeight(Math.round(vv.height))
-      } else {
-        setVvHeight(null)
-      }
+      keyboardVisibleRef.current = vv.height < window.innerHeight * 0.8
+      setVvHeight(Math.round(vv.height))
     }
     handleResize()
     vv.addEventListener('resize', handleResize)
@@ -1502,7 +1575,8 @@ export default function Terminal({ token }: Props) {
     showScrollbackRef.current = false
     setShowScrollback(false)
     setScrollbackContent('')
-    // Keep cached scrollback for instant reopen; next window/session uses keyed cache.
+    scrollbackCacheRef.current = null
+    scrollbackPrefetchRef.current = null
   }
 
   function handleOverlayScroll(e: React.UIEvent<HTMLDivElement>) {
@@ -1519,19 +1593,21 @@ export default function Terminal({ token }: Props) {
     swipeUpAccumRef.current = 0
     setShowScrollback(true)
 
-    const wi = activeWindowIndexRef.current
-    const s = activeTmuxSessionRef.current
-    const key = scrollbackKey(s, wi)
-
     // Use pre-fetched cache if available (no loading flash)
-    if (scrollbackCacheRef.current[key] !== undefined) {
-      setScrollbackContent(scrollbackCacheRef.current[key])
+    if (scrollbackCacheRef.current !== null) {
+      setScrollbackContent(scrollbackCacheRef.current)
       setScrollbackLoading(false)
       return
     }
 
     setScrollbackLoading(true)
-    const promise = scrollbackPrefetchRef.current[key] ?? prefetchScrollback(wi, s)!
+    const wi = activeWindowIndexRef.current
+    const s = activeTmuxSessionRef.current
+    const promise = scrollbackPrefetchRef.current ??
+      apiFetch(`/api/sessions/${wi}/scrollback?session=${encodeURIComponent(s)}&lines=3000`)
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+
+    scrollbackPrefetchRef.current = null
     promise
       .then(({ content }: { content: string }) => {
         setScrollbackContent(content.trimEnd())
@@ -1566,46 +1642,11 @@ export default function Terminal({ token }: Props) {
     onOpenWorkspace: () => setShowWorkspace(true),
     onUpload: handleFileUpload,
     onUploadFile: uploadFile,
+    onUploadFiles: enqueueFiles,
     onShowCopySheet: (text: string) => setCopySheetText(text),
     collapsed: toolbarCollapsed,
     onCollapsedChange: setToolbarCollapsed,
   }
-
-  const imePreviewBar = keyboardVisible ? (
-    <div style={{
-      height: INPUT_BAR_HEIGHT,
-      flexShrink: 0,
-      background: 'var(--nexus-bg)',
-      color: 'var(--nexus-text)',
-      fontFamily: 'Menlo, Monaco, "Cascadia Code", "Fira Code", monospace',
-      fontSize: 14,
-      padding: '0 8px',
-      borderTop: '1px solid var(--nexus-border)',
-      display: 'flex',
-      alignItems: 'center',
-      gap: 8,
-      overflow: 'hidden',
-      whiteSpace: 'nowrap',
-    }}>
-      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', opacity: compositionText ? 1 : 0.3 }}>
-        {compositionText || '·'}
-      </span>
-      <button
-        onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setShowKeyboardShortcuts(v => !v) }}
-        style={{
-          width: 34,
-          height: 24,
-          borderRadius: 6,
-          border: '1px solid var(--nexus-border)',
-          background: showKeyboardShortcuts ? 'var(--nexus-accent)' : 'var(--nexus-bg2)',
-          color: showKeyboardShortcuts ? '#fff' : 'var(--nexus-text)',
-          fontSize: 13,
-          fontFamily: 'inherit',
-        }}
-        aria-label="快捷键"
-      >⌘</button>
-    </div>
-  ) : null
 
   return (
     <div className="flex flex-col w-full relative" style={{ height: vvHeight ?? '100dvh' }}>
@@ -1622,14 +1663,22 @@ export default function Terminal({ token }: Props) {
         onCompositionEnd={handleCompositionEnd}
         aria-hidden="true"
       />
+      {/* iOS 相册/文件选择器有两条硬规则：
+           1) input 必须是"视觉上真实存在"的元素（不能 display:none / 0 尺寸 /
+              pointer-events:none，否则系统认为它不是 interactive，.click() 静默失败）
+           2) .click() 必须在用户手势同步栈里调用（已满足：onClick 里直接调）
+           方案：opacity 0.01 保持不可见，但尺寸放大、保留 pointer-events。
+           再叠加 left:-9999px 把它挪出屏幕外防止意外点击/视觉闪动，对
+           iOS 来说这仍视为有效元素。 */}
       <input
         ref={fileInputRef}
         type="file"
         accept="image/*,video/*"
-        className="fixed top-0 left-0 w-px h-px opacity-[0.01] text-base pointer-events-none -z-10"
+        multiple
+        className="fixed top-0 opacity-[0.01]"
+        style={{ left: '-9999px', width: '44px', height: '44px', fontSize: '16px' }}
         onChange={(e) => {
-          const file = e.target.files?.[0]
-          if (file) uploadFile(file)
+          enqueueFiles(e.target.files)
           e.target.value = '' // reset
         }}
         aria-hidden="true"
@@ -1637,10 +1686,11 @@ export default function Terminal({ token }: Props) {
       <input
         ref={pasteFileRef}
         type="file"
-        className="fixed top-0 left-0 w-px h-px opacity-[0.01] text-base pointer-events-none -z-10"
+        multiple
+        className="fixed top-0 opacity-[0.01]"
+        style={{ left: '-9999px', width: '44px', height: '44px', fontSize: '16px' }}
         onChange={(e) => {
-          const file = e.target.files?.[0]
-          if (file) uploadFile(file)
+          enqueueFiles(e.target.files)
           e.target.value = '' // reset
         }}
         aria-hidden="true"
@@ -1797,7 +1847,6 @@ export default function Terminal({ token }: Props) {
             </div>
             <div className="flex-1 flex flex-col min-w-0 relative">
               <div ref={containerRef} className="flex-1 overflow-hidden relative" />
-              {imePreviewBar}
               {isConnecting && (
                 <div className="absolute inset-0 bg-nexus-bg flex flex-col items-center justify-center gap-3 z-10">
                   <div className="w-8 h-8 border-[3px] border-nexus-border border-t-nexus-accent rounded-full animate-spin" />
@@ -1824,98 +1873,9 @@ export default function Terminal({ token }: Props) {
               <button className="absolute bottom-3 right-3 w-9 h-9 rounded-full bg-nexus-accent border-none text-white text-lg cursor-pointer z-50 flex items-center justify-center shadow-lg backdrop-blur-sm" onClick={scrollToBottom} title="滚到底部"><Icon name="arrowDown" size={16} /></button>
             )}
           </div>
-          <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={(keyboardVisible ? INPUT_BAR_HEIGHT : toolbarHeightRef.current)} />
-          {imePreviewBar}
-          {!keyboardVisible && (
-            <>
-              {/* 28px compact bar — 无键盘时手机常态显示 */}
-              <div ref={toolbarWrapRef} style={{
-                height: INPUT_BAR_HEIGHT,
-                flexShrink: 0,
-                background: 'var(--nexus-bg)',
-                borderTop: '1px solid var(--nexus-border)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'flex-end',
-                padding: '0 8px',
-                gap: 8,
-              }}>
-                <button
-                  onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setMobileToolbarOpen(v => !v) }}
-                  style={{
-                    width: 34,
-                    height: 24,
-                    borderRadius: 6,
-                    border: '1px solid var(--nexus-border)',
-                    background: mobileToolbarOpen ? 'var(--nexus-accent)' : 'var(--nexus-bg2)',
-                    color: mobileToolbarOpen ? '#fff' : 'var(--nexus-text)',
-                    fontSize: 13,
-                    fontFamily: 'inherit',
-                  }}
-                  aria-label="展开工具栏"
-                >⌘</button>
-              </div>
-              {/* 展开完整 Toolbar 浮层 */}
-              {mobileToolbarOpen && (
-                <>
-                  <div className="fixed inset-0 z-[250]" onPointerDown={() => setMobileToolbarOpen(false)} />
-                  <div
-                    className="fixed left-0 right-0 z-[260] shadow-[0_-4px_18px_rgba(0,0,0,0.28)]"
-                    style={{ bottom: INPUT_BAR_HEIGHT }}
-                    onPointerDown={(e) => e.stopPropagation()}
-                  >
-                    <Toolbar {...toolbarProps} collapsed={false} onCollapsedChange={() => {}} />
-                  </div>
-                </>
-              )}
-            </>
-          )}
-
-          {/* 移动端 Channel 指示器：右侧竖排可点击小圆点 */}
-          {!isWidePC && windows.length > 0 && (
-            <div className="fixed right-1.5 top-1/2 -translate-y-1/2 z-20 flex flex-col gap-2">
-              {windows.map(win => {
-                const status = getWindowStatus(windowOutputs[win.index])
-                const isActive = win.index === activeWindowIndex
-                return (
-                  <button
-                    key={win.index}
-                    onClick={() => attachToWindow(win.index)}
-                    className="flex items-center justify-center w-7 h-7 p-0 bg-transparent border-2 rounded-full cursor-pointer transition-all duration-100 active:scale-90"
-                    style={{
-                      borderColor: isActive ? 'var(--nexus-accent)' : STATUS_DOT_COLOR[status],
-                      background: isActive ? STATUS_DOT_COLOR[status] : 'transparent',
-                      touchAction: 'manipulation',
-                    }}
-                    aria-label={win.name}
-                    title={win.name}
-                  />
-                )
-              })}
-              {/* + 按钮：快速新建默认 claude channel */}
-              <button
-                onClick={() => createWindow('claude')}
-                className="flex items-center justify-center w-7 h-7 p-0 bg-transparent border border-nexus-border rounded-full cursor-pointer transition-all duration-100 active:scale-90 text-nexus-text-2 hover:text-nexus-text hover:border-nexus-accent"
-                style={{ touchAction: 'manipulation', fontSize: 20, lineHeight: 1 }}
-                aria-label="新建 channel"
-                title="新建 channel"
-              >+</button>
-            </div>
-          )}
+          <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={toolbarHeightRef.current} />
+          <div ref={toolbarWrapRef}><Toolbar {...toolbarProps} /></div>
         </div>
-      )}
-
-      {keyboardVisible && showKeyboardShortcuts && !isWidePC && (
-        <>
-          <div className="fixed inset-0 z-[250]" onPointerDown={() => setShowKeyboardShortcuts(false)} />
-          <div
-            className="fixed left-0 right-0 z-[260] shadow-[0_-4px_18px_rgba(0,0,0,0.28)]"
-            style={{ bottom: INPUT_BAR_HEIGHT }}
-            onPointerDown={(e) => e.stopPropagation()}
-          >
-            <Toolbar {...toolbarProps} collapsed={false} onCollapsedChange={() => {}} />
-          </div>
-        </>
       )}
 
       {/* 移动端会话抽屉 */}
@@ -2223,12 +2183,55 @@ export default function Terminal({ token }: Props) {
         )
       })()}
 
-      {/* 上传文件通知条 */}
-      {uploadNotifications.length > 0 && (
+      {/* 上传面板：进度条 + 完成通知 */}
+      {(uploadQueue.some(u => u.status !== 'done') || uploadNotifications.length > 0) && (
         <div
           className="fixed left-1/2 -translate-x-1/2 z-[200] flex flex-col gap-2 max-w-[90vw] w-[480px]"
           style={{ bottom: isWidePC ? 16 : (toolbarHeightRef.current + 16) }}
         >
+          {/* 进度条 */}
+          {uploadQueue.filter(u => u.status !== 'done').map((item) => (
+            <div
+              key={item.id}
+              className="flex flex-col gap-1.5 p-2.5 px-3 rounded-lg shadow-[0_4px_20px_rgba(0,0,0,0.25)]"
+              style={{
+                background: 'color-mix(in srgb, var(--nexus-bg2) 92%, transparent)',
+                backdropFilter: 'blur(12px)',
+                WebkitBackdropFilter: 'blur(12px)',
+                border: '1px solid color-mix(in srgb, var(--nexus-border) 50%, transparent)',
+              }}
+            >
+              <div className="flex items-center gap-2">
+                <span className="flex-1 text-nexus-text text-sm overflow-hidden text-ellipsis whitespace-nowrap" title={item.file.name}>
+                  {item.file.name}
+                </span>
+                <span className="text-nexus-text-2 text-xs whitespace-nowrap">
+                  {item.status === 'pending' && '等待中'}
+                  {item.status === 'uploading' && `${item.progress}%`}
+                  {item.status === 'conflict' && '已存在'}
+                  {item.status === 'error' && (item.error || '失败')}
+                </span>
+                {(item.status === 'pending' || item.status === 'uploading') && (
+                  <button
+                    onClick={() => cancelUpload(item.id)}
+                    className="bg-transparent border-none text-nexus-text-2 cursor-pointer p-0.5 flex items-center justify-center"
+                    title="取消"
+                  >
+                    <Icon name="x" size={14} />
+                  </button>
+                )}
+              </div>
+              {item.status === 'uploading' && (
+                <div className="w-full h-1 rounded-full bg-nexus-bg-2 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-nexus-accent transition-all duration-150"
+                    style={{ width: `${item.progress}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          ))}
+          {/* 完成通知条 */}
           {uploadNotifications.map((notification) => (
             <div
               key={notification.id}
