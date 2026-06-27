@@ -1363,7 +1363,12 @@ export default function Terminal({ token }: Props) {
     // If this window had a saved scroll position, don't auto-scroll on incoming messages
     // until the restore timeout in attachToWindow fires and onScroll updates the ref.
     const hasSavedScroll = (scrollPositionsRef.current[activeWindowIndex] ?? 0) > 0
-    userScrolledRef.current = hasSavedScroll
+    const shouldRestoreSavedScroll = isWidePC && hasSavedScroll
+    // Mobile Safari can restore a stale xterm scroll position after address-bar
+    // resize or reconnect, leaving the live terminal visually blank while
+    // scrollback still has content. On mobile, always re-follow live output on
+    // WebSocket reconnect; users can still open history via the scrollback gesture.
+    userScrolledRef.current = shouldRestoreSavedScroll
     hasConnectedRef.current = false
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -1419,6 +1424,10 @@ export default function Terminal({ token }: Props) {
           fitAddonRef.current?.fit()
           if (wsRef.current?.readyState === WebSocket.OPEN && termRef.current) {
             wsRef.current.send(JSON.stringify({ type: 'resize', cols: termRef.current.cols, rows: termRef.current.rows }))
+            if (!isWidePC) {
+              termRef.current.scrollToBottom()
+              termRef.current.refresh(0, Math.max(termRef.current.rows - 1, 0))
+            }
           }
         })
       }
@@ -1455,7 +1464,7 @@ export default function Terminal({ token }: Props) {
       clearTimeout(loadingTimer)
       wsRef.current?.close()
     }
-  }, [token, activeWindowIndex, wsSessionKey])
+  }, [token, activeWindowIndex, wsSessionKey, isWidePC])
 
   const isComposingRef = useRef(false)
 
@@ -1874,6 +1883,37 @@ export default function Terminal({ token }: Props) {
             )}
           </div>
           <SessionFAB onClick={() => setShowSessionManagerV2(v => !v)} windowCount={windows.length} bottomInset={toolbarHeightRef.current} />
+          {windows.length > 1 && (
+            <div
+              className="fixed right-2 z-[350] flex flex-col gap-2"
+              style={{ top: '35%', bottom: toolbarHeightRef.current + 88 }}
+              aria-label="窗口切换"
+            >
+              {windows.map(win => {
+                const status = getWindowStatus(windowOutputs[win.index])
+                const isActive = win.index === activeWindowIndex
+                return (
+                  <button
+                    key={win.index}
+                    type="button"
+                    onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); attachToWindow(win.index) }}
+                    className="w-8 h-8 rounded-full flex items-center justify-center backdrop-blur-sm shadow-lg"
+                    style={{
+                      background: isActive ? 'var(--nexus-accent)' : 'rgba(20, 30, 48, 0.82)',
+                      border: isActive ? '2px solid rgba(255,255,255,0.9)' : '1px solid var(--nexus-border)',
+                      color: isActive ? '#fff' : 'var(--nexus-text2)',
+                    }}
+                    title={win.name}
+                  >
+                    <span
+                      className="w-2.5 h-2.5 rounded-full"
+                      style={{ background: STATUS_DOT_COLOR[status] }}
+                    />
+                  </button>
+                )
+              })}
+            </div>
+          )}
           <div ref={toolbarWrapRef}><Toolbar {...toolbarProps} /></div>
         </div>
       )}
