@@ -110,6 +110,18 @@ function buildInteractiveShellCmd(prefix = '') {
 app.use(express.static(join(__dirname, 'public')));
 app.use(express.static(join(__dirname, 'frontend', 'dist')));
 
+// Deep health: catches "process alive but app unusable" cases such as missing
+// frontend dist or corrupt node_modules (e.g. iconv-lite encodings missing,
+// which breaks express.json() and login before password verification).
+app.get('/healthz', (_req, res) => {
+  const checks = {
+    frontendDist: existsSync(join(__dirname, 'frontend', 'dist', 'index.html')),
+    iconvLiteEncodings: existsSync(join(__dirname, 'node_modules', 'iconv-lite', 'encodings')),
+  };
+  const ok = Object.values(checks).every(Boolean);
+  res.status(ok ? 200 : 503).json({ ok, checks });
+});
+
 // Auth middleware
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || '';
