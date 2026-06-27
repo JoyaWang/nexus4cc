@@ -1904,6 +1904,7 @@ export default function Terminal({ token }: Props) {
                       color: isActive ? '#fff' : 'var(--nexus-text2)',
                     }}
                     title={win.name}
+                    aria-label={`切换到 ${win.name}`}
                   >
                     <span
                       className="w-2.5 h-2.5 rounded-full"
@@ -1912,6 +1913,20 @@ export default function Terminal({ token }: Props) {
                   </button>
                 )
               })}
+              <button
+                type="button"
+                onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); handleCreateWindow() }}
+                className="w-8 h-8 rounded-full flex items-center justify-center backdrop-blur-sm shadow-lg text-lg font-semibold"
+                style={{
+                  background: 'rgba(20, 30, 48, 0.82)',
+                  border: '1px solid var(--nexus-border)',
+                  color: 'var(--nexus-text)',
+                }}
+                title="新建窗口"
+                aria-label="新建窗口"
+              >
+                +
+              </button>
             </div>
           )}
           <div ref={toolbarWrapRef}><Toolbar {...toolbarProps} /></div>
