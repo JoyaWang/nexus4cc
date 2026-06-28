@@ -11,6 +11,7 @@ import GhostShield from './GhostShield'
 import { Icon } from './icons'
 import { getWindowStatus, STATUS_DOT_COLOR, STATUS_DOT_TITLE } from './windowStatus'
 import { apiFetch, handleAuthFailure } from './lib/api'
+import { mapSpecialKey, shouldSkipInput } from './mobileInput'
 
 // ANSI 256-color palette (0-15 standard, 16-231 6x6x6 cube, 232-255 grayscale)
 const ANSI256: string[] = (() => {
@@ -1473,7 +1474,12 @@ export default function Terminal({ token }: Props) {
   const isComposingRef = useRef(false)
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    if (isComposingRef.current) return // handled by compositionEnd
+    const native = e.nativeEvent as InputEvent
+    if (shouldSkipInput({
+      isComposing: native.isComposing,
+      inputType: native.inputType,
+      refFlag: isComposingRef.current,
+    })) return // composition in progress — compositionEnd will send final text
     // Fallback for Android (keydown fires key='Unidentified', onChange is reliable there)
     const val = e.target.value
     if (val) { sendToWs(val); e.target.value = '' }
@@ -1481,30 +1487,14 @@ export default function Terminal({ token }: Props) {
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (isComposingRef.current) return
-    if (e.key === 'Enter') { e.preventDefault(); sendToWs('\r') }
-    else if (e.key === 'Backspace') { e.preventDefault(); sendToWs('\x7f') }
-    else if (e.key === 'Tab') { e.preventDefault(); sendToWs('\t') }
-    else if (e.key === 'Escape') { e.preventDefault(); sendToWs('\x1b') }
-    else if (e.key === 'Delete') { e.preventDefault(); sendToWs('\x1b[3~') }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); sendToWs('\x1b[A') }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); sendToWs('\x1b[B') }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); sendToWs('\x1b[C') }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); sendToWs('\x1b[D') }
-    else if (e.key === 'Home') { e.preventDefault(); sendToWs('\x1b[H') }
-    else if (e.key === 'End') { e.preventDefault(); sendToWs('\x1b[F') }
-    else if (e.key === 'PageUp') { e.preventDefault(); sendToWs('\x1b[5~') }
-    else if (e.key === 'PageDown') { e.preventDefault(); sendToWs('\x1b[6~') }
-    else if (e.ctrlKey && e.key.length === 1) {
+    const mapped = mapSpecialKey(e.key, e.ctrlKey)
+    if (mapped !== null) {
       e.preventDefault()
-      sendToWs(String.fromCharCode(e.key.toLowerCase().charCodeAt(0) - 96))
+      sendToWs(mapped)
     }
-    else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      // Intercept printable chars (letters, digits, punctuation) directly from keydown.
-      // preventDefault stops the browser from updating input.value, so onChange won't
-      // double-fire. This is reliable on iOS/desktop where e.key is always correct.
-      e.preventDefault()
-      sendToWs(e.key)
-    }
+    // Printable chars, Unidentified, modifier+char combos fall through.
+    // They populate input.value and trigger onChange → handleInputChange,
+    // which is guarded by composition signals to avoid leaking leading pinyin letters.
   }
 
   function handleCompositionEnd(e: React.CompositionEvent<HTMLInputElement>) {
