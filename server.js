@@ -106,6 +106,18 @@ function buildInteractiveShellCmd(prefix = '') {
   return `${prefix}${INTERACTIVE_SHELL_CMD}`;
 }
 
+function nextTmuxWindowIndex(sessionName) {
+  try {
+    const out = execFileSync('tmux', ['list-windows', '-t', sessionName, '-F', '#{window_index}'], { encoding: 'utf8' }).trim();
+    const used = new Set(out ? out.split('\n').map(s => Number.parseInt(s, 10)).filter(Number.isFinite) : []);
+    let idx = 0;
+    while (used.has(idx)) idx++;
+    return idx;
+  } catch {
+    return 0;
+  }
+}
+
 // 静态文件：frontend/dist 和 public
 app.use(express.static(join(__dirname, 'public')));
 app.use(express.static(join(__dirname, 'frontend', 'dist')));
@@ -216,11 +228,19 @@ app.post('/api/windows', authMiddleware, (req, res) => {
     } catch {}
   }
 
-  const cmd = `tmux new-window -t ${tmuxSession} -c "${cwd}" -n "${name}" "${shellCmd}"`;
-  exec(cmd, (err) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ name, cwd, shell_type, profile: profile || null, session: tmuxSession });
-  });
+  try {
+    const nextIndex = nextTmuxWindowIndex(tmuxSession);
+    execFileSync('tmux', [
+      'new-window',
+      '-t', `${tmuxSession}:${nextIndex}`,
+      '-c', cwd,
+      '-n', name,
+      shellCmd,
+    ], { stdio: 'pipe' });
+    res.json({ name, cwd, shell_type, profile: profile || null, session: tmuxSession, index: nextIndex });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/sessions — 在 tmux 中创建新 window
@@ -272,11 +292,19 @@ app.post('/api/sessions', authMiddleware, (req, res) => {
     } catch {}
   }
 
-  const cmd = `tmux new-window -t ${tmuxSession} -c "${cwd}" -n "${name}" "${shellCmd}"`;
-  exec(cmd, (err) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ name, cwd, shell_type, profile: profile || null, session: tmuxSession });
-  });
+  try {
+    const nextIndex = nextTmuxWindowIndex(tmuxSession);
+    execFileSync('tmux', [
+      'new-window',
+      '-t', `${tmuxSession}:${nextIndex}`,
+      '-c', cwd,
+      '-n', name,
+      shellCmd,
+    ], { stdio: 'pipe' });
+    res.json({ name, cwd, shell_type, profile: profile || null, session: tmuxSession, index: nextIndex });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/configs — 列出所有 claude 配置 profile
@@ -1279,16 +1307,19 @@ app.post('/api/projects/:name/channels', authMiddleware, (req, res) => {
     } catch {}
   }
 
-  // 创建新 window —— 改 execFileSync 避免 shellCmd 引号嵌套问题
+  // 创建新 window —— explicitly target a free index because tmux may otherwise
+  // reuse the active index when window indexes have gaps (e.g. 0,2,6), yielding
+  // "create window failed: index 6 in use".
   try {
+    const nextIndex = nextTmuxWindowIndex(sessionName)
     execFileSync('tmux', [
       'new-window',
-      '-t', sessionName,
+      '-t', `${sessionName}:${nextIndex}`,
       '-c', cwd,
       '-n', channelName,
       shellCmd,
     ], { stdio: 'pipe' })
-    res.json({ name: channelName, cwd, shell_type, profile: profile || null, project: sessionName })
+    res.json({ name: channelName, cwd, shell_type, profile: profile || null, project: sessionName, index: nextIndex })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

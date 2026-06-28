@@ -710,9 +710,13 @@ export default function Terminal({ token }: Props) {
             attachToWindow(newWin.index)
           }
         }
+      } else {
+        const message = await r.text().catch(() => '')
+        termRef.current?.writeln(`\r\n\x1b[31m[Nexus: 新建窗口失败]\x1b[0m HTTP ${r.status} ${message.slice(0, 200)}`)
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      termRef.current?.writeln(`\r\n\x1b[31m[Nexus: 新建窗口失败]\x1b[0m ${message}`)
     }
   }
 
