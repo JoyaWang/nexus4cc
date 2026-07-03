@@ -97,16 +97,42 @@ Telegram Bot（可选）
 ```javascript
 // 每个 "session:windowIndex" 独立 PTY 实例
 const ptyMap = new Map()
-// entry: { pty, clients: Set<ws>, clientSizes: Map<ws, {cols,rows}>, lastOutput, lastActivity }
+// entry: {
+//   pty,                          // node-pty 子进程（tmux attach-session）
+//   clients: Set<ws>,             // 当前连接的 WebSocket
+//   clientSizes: Map<ws, {cols,rows}>,  // 每个 client 最近一次上报的尺寸
+//   clientModes: Map<ws, 'active'|'passive'>,  // Phase 2: resize 隔离模式
+//   lastOutput, lastActivity
+// }
 
-function getOrCreatePty(session, windowIndex) {
+function ensureWindowPty(session, windowIndex) {
   // key = "session:windowIndex"
   // 按需 spawn tmux attach-session -t session:window
   // 不存在时自动 fallback 到可用窗口
 }
 ```
 
-**Resize 策略**: 多客户端时取所有连接的最小尺寸（min cols/rows），防止小屏遮挡内容。
+#### Resize 策略（Phase 2 server-side resize isolation）
+
+每个 WebSocket 连接在 URL 上声明 `resizeMode=active|passive`（默认 `active`，保持 Web 端旧行为兼容）：
+
+| 模式 | 谁会用 | resize message 行为 | 断连后回算 |
+|---|---|---|---|
+| `active`（默认） | Web PC、主动操作的客户端 | 调用 `pty.resize` | 参与 min cols/rows 回算 |
+| `passive` | Nexus Go 移动端、观察型小窗 | **只记录** `clientSizes`，**不调用** `pty.resize` | **不参与** active clients 的回算 |
+
+决策逻辑抽到纯函数模块 `server/resizePolicy.js`，便于单元测试：
+
+- `parseResizeMode(param)` — 解析 URL query，未知值/缺省 → `active`
+- `shouldResizePTY(mode)` — `passive` 返回 false
+- `activeClientSizes(sizes, modes)` — 过滤出 active clients 的尺寸
+- `computeMinSize(sizes)` — 计算最小 cols/rows
+
+**No-PC-break 保证**：手机/被动 client 连接同一 `session:window` 时，无论它如何 resize、何时断开，都不会改变共享 PTY/tmux pane 的尺寸，PC active client 的视口不被破坏。
+
+**Phase 3 接入点**：Nexus Go 移动端将用 `/ws?...&resizeMode=passive` 连接，无需自带 server-side 协调。
+
+> 注：Phase 2 之前文档曾写「多客户端取最小尺寸」，但实际 resize 路径是 last-writer-wins（resize message 直接 `pty.resize(newCols, newRows)`），仅在 client 断连后才回算 min。Phase 2 在此基础上增加 mode 隔离，行为对 active 子集保持不变。
 
 ### 任务系统（runTask 统一抽象）
 

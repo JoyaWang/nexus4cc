@@ -64,6 +64,7 @@ All F-01 to F-18 complete.
 | 浮动「回底部」按钮（term.onScroll 追踪）| `d2f73f6` |
 | 优化：xterm/WS 双 Effect 分离（窗口切换无抖动）| `dcac810` |
 | 修复：多客户端 resize 改用最小尺寸策略 | `3b56134` |
+| Phase 2：server-side resize isolation（`resizeMode=passive`，移动端不破坏 PC pane） | 本分支 |
 | PWA：注册 Service Worker + SVG 图标 | `793543c` |
 | 跟随系统深色/浅色模式自动切换 | `3f736a0` |
 | 布局：100dvh 修复 iOS Safari 高度 | `3f736a0` |

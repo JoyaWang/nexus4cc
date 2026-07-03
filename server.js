@@ -12,6 +12,13 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlink
 import { readdir, stat as statAsync } from 'fs/promises';
 import https from 'node:https';
 import multer from 'multer';
+import {
+  RESIZE_MODE,
+  parseResizeMode,
+  shouldResizePTY,
+  activeClientSizes,
+  computeMinSize,
+} from './server/resizePolicy.js';
 
 // 加载 .env 文件（如果存在）
 try {
@@ -1954,10 +1961,10 @@ function ensureWindowPty(session, windowIndex) {
     });
   } catch (err) {
     console.error(`pty.spawn failed for ${safeSession}:${targetWindow}:`, err.message);
-    return { key: actualKey, entry: { pty: null, clients: new Set(), clientSizes: new Map(), lastOutput: '', lastActivity: Date.now() } };
+    return { key: actualKey, entry: { pty: null, clients: new Set(), clientSizes: new Map(), clientModes: new Map(), lastOutput: '', lastActivity: Date.now() } };
   }
 
-  const entry = { pty: ptyProc, clients: new Set(), clientSizes: new Map(), lastOutput: '', lastActivity: Date.now() };
+  const entry = { pty: ptyProc, clients: new Set(), clientSizes: new Map(), clientModes: new Map(), lastOutput: '', lastActivity: Date.now() };
   ptyMap.set(actualKey, entry);
 
   ptyProc.onData((data) => {
@@ -1995,6 +2002,10 @@ wss.on('connection', (ws, req) => {
   const windowParam = url.searchParams.get('window') || '0';
   const windowIndex = parseInt(windowParam, 10) || 0;
   const session = url.searchParams.get('session') || TMUX_SESSION;
+  // Phase 2 resize isolation: passive clients (e.g. Nexus Go mobile companion)
+  // connect with `resizeMode=passive` and must not change the shared PTY size.
+  // Default is ACTIVE so existing Web clients keep working unchanged.
+  const resizeMode = parseResizeMode(url.searchParams.get('resizeMode'));
 
   try {
     jwt.verify(token, JWT_SECRET);
@@ -2005,7 +2016,8 @@ wss.on('connection', (ws, req) => {
 
   const { key, entry } = ensureWindowPty(session, windowIndex);
   entry.clients.add(ws);
-  console.log(`Client connected to ${key} (clients: ${entry.clients.size})`);
+  entry.clientModes.set(ws, resizeMode);
+  console.log(`Client connected to ${key} (clients: ${entry.clients.size}, resizeMode: ${resizeMode})`);
 
   // Send recent output so the screen isn't blank while waiting for the first repaint.
   if (entry.lastOutput) {
@@ -2024,9 +2036,13 @@ wss.on('connection', (ws, req) => {
         const newCols = Number(data.cols);
         const newRows = Number(data.rows);
         ent.clientSizes.set(ws, { cols: newCols, rows: newRows });
-        // 直接使用当前客户端的尺寸，而不是所有客户端的最小值
-        // 避免多个客户端/窗口切换时的尺寸混乱
-        ent.pty.resize(Math.max(newCols, 10), Math.max(newRows, 5));
+        // Phase 2 resize isolation: passive clients record their size but must
+        // NOT call pty.resize — they are observers of the shared PTY/tmux pane
+        // and must not break the active (PC) client's viewport.
+        const mode = ent.clientModes.get(ws);
+        if (shouldResizePTY(mode)) {
+          ent.pty.resize(Math.max(newCols, 10), Math.max(newRows, 5));
+        }
       }
     } catch { /* not JSON — fall through to pty.write */ }
     // Write for all non-resize messages. Previously only the catch branch wrote,
@@ -2040,15 +2056,15 @@ wss.on('connection', (ws, req) => {
     if (ent) {
       ent.clients.delete(ws);
       ent.clientSizes.delete(ws);
+      ent.clientModes.delete(ws);
       console.log(`Client disconnected from ${key} (clients: ${ent.clients.size})`);
-      // Recompute minimum size if other clients remain
+      // Recompute minimum size across REMAINING ACTIVE clients only.
+      // Passive clients never participate in recomputation — their disconnect
+      // must not change the shared PTY size either.
       if (ent.clients.size > 0 && ent.clientSizes.size > 0) {
-        let minCols = Infinity, minRows = Infinity;
-        for (const [, size] of ent.clientSizes) {
-          if (size.cols < minCols) minCols = size.cols;
-          if (size.rows < minRows) minRows = size.rows;
-        }
-        if (minCols !== Infinity) ent.pty.resize(Math.max(minCols, 10), Math.max(minRows, 5));
+        const activeSizes = activeClientSizes(ent.clientSizes, ent.clientModes);
+        const minSize = computeMinSize(activeSizes);
+        if (minSize) ent.pty.resize(Math.max(minSize.cols, 10), Math.max(minSize.rows, 5));
       }
       // 如果 5 分钟后没有客户端，清理 PTY 节省资源
       setTimeout(() => {
@@ -2065,7 +2081,7 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => {
     console.error('WebSocket error:', err.message);
     const ent = ptyMap.get(key);
-    if (ent) { ent.clients.delete(ws); ent.clientSizes.delete(ws); }
+    if (ent) { ent.clients.delete(ws); ent.clientSizes.delete(ws); ent.clientModes.delete(ws); }
   });
 });
 
