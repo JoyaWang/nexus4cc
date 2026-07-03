@@ -13,7 +13,6 @@ import { readdir, stat as statAsync } from 'fs/promises';
 import https from 'node:https';
 import multer from 'multer';
 import {
-  RESIZE_MODE,
   parseResizeMode,
   shouldResizePTY,
   activeClientSizes,
