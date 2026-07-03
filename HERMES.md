@@ -1,0 +1,1 @@
+/Users/joya/JoyaProjects/joya-lib/joya-ai-sys/doc-template/HERMES.md
