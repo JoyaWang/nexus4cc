@@ -11,7 +11,7 @@ Anchor: `docs/NORTH-STAR.md` — 修改任何文档前先对照锚点三原则
 |---|---|
 | Backend | Node.js (ESM) + Express + ws + node-pty |
 | Frontend | React 18 + TypeScript + xterm.js + Vite |
-| Auth | JWT (30d) + bcrypt password hash |
+| Auth | JWT accessToken (15min) + opaque refreshToken (90d rotation) + bcrypt password hash |
 | Runtime | 宿主机（WSL2）直接运行，Node.js + PM2 管理 |
 | Config | `.env` → `server.js` 顶部解构，无 dotenv 依赖 |
 | Persist | `./data/`（toolbar config、session configs） |
@@ -71,6 +71,7 @@ docs/
 |---|---|
 | `package.json` | `"version"` |
 | `frontend/package.json` | `"version"` |
+| `data/auth/refresh-tokens.json` | refresh token family 持久化（sha256 hash only，原子写 0600） |
 
 发布流程：
 ```bash

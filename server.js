@@ -2,8 +2,6 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import * as pty from 'node-pty';
-import jwt from 'jsonwebtoken';
-import bcrypt from 'bcrypt';
 import { createServer } from 'node:http';
 import { exec, spawn, execSync, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -18,6 +16,8 @@ import {
   activeClientSizes,
   computeMinSize,
 } from './server/resizePolicy.js';
+import { verifyAccessToken } from './server/auth/tokens.js';
+import { createAuthService, mountRoutes as mountAuthRoutes } from './server/auth/authService.js';
 
 // 加载 .env 文件（如果存在）
 try {
@@ -96,6 +96,28 @@ if (!JWT_SECRET || !ACC_PASSWORD_HASH) {
   process.exit(1);
 }
 
+const ACCESS_TOKEN_EXPIRY_SECONDS = parseInt(process.env.ACCESS_TOKEN_EXPIRY_SECONDS || '900', 10);
+const REFRESH_TOKEN_EXPIRY_DAYS = parseInt(process.env.REFRESH_TOKEN_EXPIRY_DAYS || '90', 10);
+
+if (!Number.isInteger(ACCESS_TOKEN_EXPIRY_SECONDS) || ACCESS_TOKEN_EXPIRY_SECONDS <= 0) {
+  console.error(`ERROR: ACCESS_TOKEN_EXPIRY_SECONDS must be a positive integer, got ${process.env.ACCESS_TOKEN_EXPIRY_SECONDS}`);
+  process.exit(1);
+}
+if (!Number.isInteger(REFRESH_TOKEN_EXPIRY_DAYS) || REFRESH_TOKEN_EXPIRY_DAYS <= 0) {
+  console.error(`ERROR: REFRESH_TOKEN_EXPIRY_DAYS must be a positive integer, got ${process.env.REFRESH_TOKEN_EXPIRY_DAYS}`);
+  process.exit(1);
+}
+
+// Auth service (extracted for testability)
+const TOKEN_STORE_PATH = join(DATA_DIR, 'auth', 'refresh-tokens.json');
+const authService = createAuthService({
+  jwtSecret: JWT_SECRET,
+  passwordHash: ACC_PASSWORD_HASH,
+  accessTokenExpiry: ACCESS_TOKEN_EXPIRY_SECONDS,
+  refreshTokenExpiryDays: REFRESH_TOKEN_EXPIRY_DAYS,
+  storePath: TOKEN_STORE_PATH,
+});
+
 function commandExists(cmd) {
   try {
     execSync(`command -v ${cmd} >/dev/null 2>&1`);
@@ -124,6 +146,13 @@ function nextTmuxWindowIndex(sessionName) {
   }
 }
 
+// Deep defense: explicitly reject any request to /data/auth/* — the refresh token
+// store must never be served, even if the static middleware or a misconfigured
+// volume mount would otherwise expose it.
+app.all('/data/auth/*', (_req, res) => {
+  res.status(404).json({ error: 'not found' });
+});
+
 // 静态文件：frontend/dist 和 public
 app.use(express.static(join(__dirname, 'public')));
 app.use(express.static(join(__dirname, 'frontend', 'dist')));
@@ -140,32 +169,21 @@ app.get('/healthz', (_req, res) => {
   res.status(ok ? 200 : 503).json({ ok, checks });
 });
 
-// Auth middleware
+// Auth middleware — only accepts access tokens (type=access JWT)
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
-    jwt.verify(token, JWT_SECRET);
+    verifyAccessToken(token, JWT_SECRET);
     next();
   } catch {
     res.status(401).json({ error: 'unauthorized' });
   }
 }
 
-// POST /api/auth/login
-app.post('/api/auth/login', async (req, res) => {
-  const { password } = req.body || {};
-  if (!password) return res.status(400).json({ error: 'password required' });
-  try {
-    const ok = await bcrypt.compare(password, ACC_PASSWORD_HASH);
-    if (!ok) return res.status(401).json({ error: 'unauthorized' });
-    const token = jwt.sign({}, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token });
-  } catch (err) {
-    res.status(500).json({ error: 'internal error' });
-  }
-});
+// Auth routes (mounted from authService — no inline handlers)
+mountAuthRoutes(app, authService, JWT_SECRET);
 
 // POST /api/windows — F-19: 项目-窗口两级结构
 // body: { rel_path?, shell_type?, profile? }
@@ -470,7 +488,7 @@ app.use('/workspace', (req, res, next) => {
   const token = req.query.token
   if (token) {
     try {
-      jwt.verify(token, JWT_SECRET)
+      verifyAccessToken(token, JWT_SECRET)
       return next()
     } catch {
       return res.status(401).send('unauthorized')
@@ -2007,7 +2025,7 @@ wss.on('connection', (ws, req) => {
   const resizeMode = parseResizeMode(url.searchParams.get('resizeMode'));
 
   try {
-    jwt.verify(token, JWT_SECRET);
+    verifyAccessToken(token, JWT_SECRET);
   } catch {
     ws.close(4001, 'unauthorized');
     return;

@@ -1,6 +1,6 @@
 # ROADMAP — Nexus
 
-**锚点**: `docs/NORTH-STAR.md` | **PRD**: `docs/PRD.md` (v1 Complete) | **更新**: 2026-04-01
+**锚点**: `docs/NORTH-STAR.md` | **PRD**: `docs/PRD.md` (v1 Complete) | **更新**: 2026-07-20
 
 ---
 
@@ -16,6 +16,14 @@ All F-01 to F-18 complete.
 | F-19 Project-Window hierarchy | tmux env NEXUS_CWD per-session |
 | F-20 Unified session manager | Slack-style Project/Channel UI |
 | Open-source polish | Git history rewrite, rate limits, etc. |
+
+---
+
+## v2.0 Implementation Ready (not deployed)
+
+| Feature | Status |
+|---|---|
+| v2-01 access/refresh 双 token 认证 | 服务端、Web前端与自动化已完成：15min access、90d rolling refresh、rotation/reuse detection、body-only revoke、JWT sub/jti/type、opaque sha256 store、atomic 0600。`npm test` 98/98、Web `tsc && vite build`通过；运行中服务尚未部署，preview兼容与真实客户端验收待执行。 |
 
 ---
 
