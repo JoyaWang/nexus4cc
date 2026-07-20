@@ -65,3 +65,33 @@ test('server.js no longer hardcodes an unconditional pty.resize in resize branch
   const branch = resizeBranchMatch[0];
   assert.match(branch, /shouldResizePTY/, 'resize branch must gate on shouldResizePTY');
 });
+
+// ---- v2 auth wiring guards ----
+
+test('server.js imports authService module', () => {
+  assert.match(serverSrc, /from ['"]\.\/server\/auth\/authService\.js['"]/);
+});
+
+test('server.js uses createAuthService for auth initialization', () => {
+  assert.match(serverSrc, /createAuthService/);
+});
+
+test('server.js uses mountAuthRoutes to wire auth endpoints', () => {
+  assert.match(serverSrc, /mountAuthRoutes/);
+});
+
+test('server.js uses verifyAccessToken (not raw jwt.verify) in authMiddleware', () => {
+  assert.match(serverSrc, /verifyAccessToken\(token,\s*JWT_SECRET\)/);
+});
+
+test('server.js uses verifyAccessToken in WebSocket connection handler', () => {
+  assert.match(serverSrc, /verifyAccessToken\(token,\s*JWT_SECRET\)/);
+});
+
+test('server.js no longer uses jwt.verify directly', () => {
+  assert.ok(!serverSrc.match(/jwt\.verify/), 'server.js must not use jwt.verify directly');
+});
+
+test('server.js no longer uses jwt.sign directly', () => {
+  assert.ok(!serverSrc.match(/jwt\.sign/), 'server.js must not use jwt.sign directly');
+});

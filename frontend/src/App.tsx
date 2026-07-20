@@ -1,17 +1,16 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import Terminal from './Terminal'
-import { STORAGE_KEY } from './lib/api'
+import { getAccessToken, setTokens } from './lib/authSession'
 
 export default function App() {
   const { t } = useTranslation()
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem(STORAGE_KEY))
+  const [token, setToken] = useState<string | null>(() => getAccessToken())
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    // 注册 Service Worker
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {})
     }
@@ -31,9 +30,9 @@ export default function App() {
         setError(t('login.wrongPassword'))
         return
       }
-      const { token: authToken } = await res.json()
-      localStorage.setItem(STORAGE_KEY, authToken)
-      setToken(authToken)
+      const data = await res.json()
+      setTokens(data.accessToken || data.token, data.refreshToken)
+      setToken(data.accessToken || data.token)
     } catch {
       setError(t('login.connectionFailed'))
     } finally {

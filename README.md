@@ -110,9 +110,14 @@ Expose securely without port forwarding via [Cloudflare Tunnel](https://develope
 
 Nexus is a **single-user, self-hosted tool** — not a multi-tenant platform.
 
-- 🔒 bcrypt (12 rounds) password hash + JWT (30d)
-- ⚠️ WebSocket token passed via query string — enable TLS in production
-- 🛡️ Run behind firewall, VPN, or tunnel — do not expose directly to the internet
+- bcrypt (12 rounds) password hash + JWT accessToken (15min) + opaque refreshToken (90d rotation)
+- Refresh token rotation with reuse detection (revoke family on replay)
+- Server stores only sha256 hash of refresh tokens (atomic write, 0600)
+- `/api/auth/refresh` — exchange refreshToken for new access+refresh pair
+- `/api/auth/revoke` — body-only refreshToken revocation; no Bearer requirement, missing body returns 400
+- The bundled Web client stores the token pair in localStorage for browser compatibility; protect the origin with TLS/CSP and dependency hygiene. Native clients should keep refresh tokens in OS secure storage.
+- WebSocket token passed via query string — enable TLS in production
+- Do not expose directly to the internet; run behind firewall, VPN, or tunnel
 
 ---
 

@@ -1,6 +1,6 @@
 # PRD — Nexus AI 终端面板 **(v1 Complete / 已完成)**
 
-**版本**: v1.0.0  **状态**: Complete  **锚点**: `docs/NORTH-STAR.md`  **完成日期**: 2026-04-01
+**版本**: v1.0.0  **状态**: Complete  **锚点**: `docs/NORTH-STAR.md`  **完成日期**: 2026-04-01  **更新**: 2026-07-20（v2 双 token 认证规格）
 
 ---
 
@@ -333,6 +333,233 @@ interface Channel {
 | 工具栏配置跨设备同步 | 重连后自动加载 |
 | 从 Telegram 发出 prompt 到收到首个 token | < 5s |
 | PWA 添加主屏并可用 | iOS Safari / Android Chrome |
+
+---
+
+## v2 Feature: access/refresh 双 token 认证（代码与自动化完成，未部署）
+
+> **状态**: 服务端、内置 Web 前端与自动化已完成；运行中的 Nexus4CC 尚未部署此版本。`npm test` 98/98、前端 `tsc && vite build` 已通过；仍需 preview 兼容与真实客户端生命周期验收。
+
+### 背景
+
+v1 使用单一 30 天 JWT `token`，无过期后自动续期能力，无服务端撤消能力。v2 升级为标准双 token 模式，保持单用户语义不变。
+
+### 概要
+
+- **accessToken**: JWT，有效期 15 分钟，含 `sub`（用户标识）、`jti`（唯一 ID）
+- **refreshToken**: 不透明随机字符串（crypto.randomBytes），服务端只存 `sha256` 哈希，有效期 90 天
+- **Refresh rotation**: 每次使用 refresh token 换新时，同时返回新的 accessToken 和新的 refreshToken，旧 refresh token 作废
+- **Revoke**: 客户端可主动撤销 refresh token（登出）
+- **Reuse detection**: 若某 refresh token 已被使用后再被使用（被轮换后旧值重放），撤销该 token 的整个 family 中所有未失效 token
+- **单用户语义**: login 仍为密码验证，无注册/多用户/角色概念
+
+### API 请求/响应
+
+#### POST /api/auth/login
+
+```
+请求: { password: "<cleartext>" }
+```
+
+成功响应 (200):
+```json
+{
+  "accessToken": "<jwt>",
+  "refreshToken": "<opaque>",
+  "expiresIn": 900,
+  "token": "<jwt>"
+}
+```
+
+- `token` 字段与 v1 向后兼容，值与 `accessToken` 相同
+- `expiresIn` 为 access token 剩余有效秒数（900 = 15min）
+- 失败: 401 `{ error: "invalid_password" }`
+
+#### POST /api/auth/refresh
+
+```
+请求: { refreshToken: "<opaque>" }
+```
+
+成功响应 (200):
+```json
+{
+  "accessToken": "<jwt>",
+  "refreshToken": "<opaque>",
+  "expiresIn": 900,
+  "token": "<jwt>"
+}
+```
+
+- 返回全新的 accessToken + refreshToken 对
+- 旧 refreshToken 及其 family 中已使用的 token 一并失效
+- 若 refreshToken 之前已被使用（reuse detection），触发 family 撤销，返回 401 `{ error: "token_reused", message: "Refresh token reuse detected; all sessions revoked" }`
+- refreshToken 过期返回 401 `{ error: "invalid_refresh_token" }`
+
+#### POST /api/auth/revoke
+
+```
+请求: { refreshToken: "<opaque>" }
+```
+
+成功响应 (200):
+```json
+{ "message": "token_revoked" }
+```
+
+- 撤销指定的 refresh token（登录时需传此值用于撤消）
+- 不要求 Bearer accessToken；access token 可能已过期，refreshToken body 本身是撤销凭据
+- 空 body 返回 400，不提供无法兑现的 Bearer-only 假成功路径
+- 用于登出场景
+
+### 令牌结构
+
+#### accessToken（JWT payload）
+
+```json
+{
+  "sub": "nexus-user",
+  "jti": "<uuid>",
+  "iat": 1720000000,
+  "exp": 1720000900
+}
+```
+
+- `sub` 固定为 `nexus-user`（单用户，无 user ID 概念）
+- `jti` 为 uuid v4，每次颁发新 access token 时生成
+- `exp - iat = 900`（15 分钟）
+- 签名算法: HS256，key 为 `JWT_SECRET` env
+
+#### refreshToken（opaque）
+
+- `crypto.randomBytes(48).toString('base64url')`，约 64 字符
+- 不存原始值，只存 `sha256` 哈希
+- 与 access token 无结构耦合（不嵌 JWT）
+
+### 持久化
+
+#### 文件路径
+
+`data/auth/refresh-tokens.json`
+
+#### Schema
+
+```json
+{
+  "families": {
+    "<familyId>": {
+      "tokens": {
+        "<sha256(token)>": {
+          "status": "active" | "used" | "revoked",
+          "createdAt": "<ISO8601>",
+          "expiresAt": "<ISO8601>"
+        }
+      },
+      "status": "active" | "revoked"
+    }
+  }
+}
+```
+
+- `familyId`: 每次 login 生成一个新的 family（uuid v4），同一次 login 通过 refresh rotation 产生的子 token 属于同一 family
+- `status = "used"`: token 已被成功用来换新一次（标记后不可再次使用）
+- `status = "revoked"`: 显式撤销或 reuse detection 触发的撤销
+- `family.status = "revoked"`: 整个 family 被撤销（reuse detection 结果）
+
+#### 原子写与权限
+
+- 每次写入使用临时文件 `data/auth/refresh-tokens.json.tmp` → `fs.rename(tmp, target)` 保证原子性
+- 新文件权限 `0o600`（仅 owner 读写）
+- 启动时若 `data/auth/` 目录不存在则自动创建（`mkdirSync` with `0o700`）
+
+#### 清理
+
+- 启动时扫描：删除所有已过期（`expiresAt < now`）且非 `active` 的 token entry
+- 启动时扫描：若 family 的 `status` 为 `revoked` 且其所有 token 均已过期，移除整个 family entry
+- 运行时每次 refresh 操作后：对当前 family 执行上述清理
+
+### 认证边界
+
+#### REST API
+
+- `POST /api/auth/login` — 无 Auth header
+- `POST /api/auth/refresh` — 无 Auth header（用 refreshToken body 认证）
+- `POST /api/auth/revoke` — 无 Auth header；必须使用 refreshToken body
+- 其他所有 `/api/*` — Bearer `<accessToken>`（同 v1，只是 token 有效期从 30d 变为 15min）
+
+#### WebSocket
+
+- 连接 URL: `wss://host/ws?token=<accessToken>`（同 v1）
+- accessToken 过期后 WebSocket 连接不会主动断开；前端应在 ws onclose 时自动 refresh → 新 accessToken → 重连
+- 不支持通过 refreshToken 建立 WebSocket 连接
+
+### 环境变量
+
+#### 新增
+
+| 变量 | 必须 | 默认 | 说明 |
+|---|---|---|---|
+| `ACCESS_TOKEN_EXPIRY_SECONDS` | | `900` | access token 有效期（秒），默认 15 分钟 |
+| `REFRESH_TOKEN_EXPIRY_DAYS` | | `90` | refresh token 有效期（天） |
+
+#### 现有变量不变
+
+- `JWT_SECRET` 继续用于 accessToken JWT 签名
+- `ACC_PASSWORD_HASH` 继续用于 login 密码验证
+
+### 迁移兼容
+
+- v1 的单一 30d JWT 登录 cookie/流程将被双 token 替换
+- **前端平滑迁移**: login 接口响应新增字段 `refreshToken`，旧客户端忽略新字段即可；`token` 字段保留，旧客户端继续使用（但过期时间变为 15min，需通过 401 响应触发重新登录）
+- **数据迁移**: 首次启动时 `data/auth/` 目录自动创建；无旧数据需迁移
+- **env 兼容**: 现有 `.env` 无需改动；`JWT_SECRET` 和 `ACC_PASSWORD_HASH` 继续有效
+
+### 前端配合（已实现，未部署）
+
+- 登录成功后存储 `accessToken`（同 v1 `token`）和 `refreshToken` 到 localStorage
+- 所有 API 请求检测 401 → 自动 `POST /api/auth/refresh` → 重试原请求
+- REST 401 通过 single-flight refresh 后精确重放一次；WebSocket 4001 refresh 后用新 access token 重连
+- 登出时调用 `POST /api/auth/revoke` 清理 refresh token
+- WebSocket `onclose` 事件中自动 refresh → 新 token → 重连
+- Web 端因浏览器架构使用 localStorage 保存 access/refresh pair；这不等同于原生 Keychain，XSS 风险必须通过同源部署、CSP与依赖治理控制。MoCode原生客户端使用Keychain/Keystore，仅持久化refresh token。
+
+### 安全属性
+
+| 属性 | 实现 |
+|---|---|
+| accessToken 短寿命 | 15min JWT，过期不可续 |
+| refreshToken 不可猜测 | crypto.randomBytes(48) |
+| 服务端不存原始 token | 只存 sha256 哈希 |
+| 原子写入防损坏 | tmp file + rename |
+| 文件权限隔离 | 0600 / 0700 |
+| 重放攻击防护 | reuse detection → family 撤销 |
+| 持久化文件不暴露 | data/auth/ 目录不应在 web 路由中可访问；server.js 应显式拒绝 `/api/auth/refresh-tokens` 路径 |
+
+### 测试 / 验收
+
+| 场景 | 预期 |
+|---|---|
+| 正常 login | 返回 accessToken + refreshToken + token + expiresIn |
+| 用 accessToken 调用受保护 API | 200 |
+| accessToken 过期后调用 API | 401 → client refresh → 重试成功 |
+| 用 refreshToken 调用 /api/auth/refresh | 200，返回全新的 access + refresh 对 |
+| 重复使用同一个 refreshToken | 第一次 200；第二次 401 `token_reused`；family 下所有 token 失效 |
+| 用已撤销的 refreshToken 调用 refresh | 401 `invalid_refresh_token` |
+| revoke 后 refresh | 401 |
+| refreshToken 过期（>90d 未用）| 401 `invalid_refresh_token` |
+| 启动时 data/auth/ 不存在 | 自动创建 |
+| 启动时清理过期 token | 过期 token entry 被删除 |
+| WebSocket 使用 accessToken | 连接成功 |
+| 旧客户端只读 token 字段 | 仍可工作（15min 后需重登录） |
+
+### 明确不做
+
+- 不做多 user / 多 session 并发管理（仍然是单用户）
+- 不做 refreshToken 的 scope / audience 限定
+- 不做 PKCE / OAuth 2.0 完整流程
+- 不做 token introspection endpoint（RFC 7662）
+- 不在 accessToken 的 JWT 中编码用户权限（单用户无权限差异）
+- 不做 refreshToken cookie-based httpOnly 模式（保持 Bearer token 一致）
 
 ---
 

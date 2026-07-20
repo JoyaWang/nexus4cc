@@ -1,6 +1,6 @@
 # ARCHITECTURE — Nexus 架构现状
 
-**Last Updated**: 2026-04-06  **版本**: v4.3.1  **锚点**: `docs/NORTH-STAR.md`
+**Last Updated**: 2026-07-20  **版本**: v4.3.1  **锚点**: `docs/NORTH-STAR.md`
 
 ---
 
@@ -29,16 +29,19 @@ Telegram Bot（可选）
 
 1. 加载 `.env`（手动解析，无 dotenv 依赖）
 2. 验证 `JWT_SECRET` 和 `ACC_PASSWORD_HASH`（缺失则 exit(1)）
-3. 确保 `data/` 和 `data/configs/` 存在
-4. 清理孤儿 running 任务（启动时 status → error）
-5. 注册 Express 路由 + multipart 上传 + 静态文件
-6. 创建 HTTP server + WebSocketServer（共享端口）
+3. 确保 `data/`、`data/auth/`、`data/configs/` 存在
+4. 加载 `data/auth/refresh-tokens.json`，清理过期 token entry
+5. 清理孤儿 running 任务（启动时 status → error）
+6. 注册 Express 路由 + multipart 上传 + 静态文件
+7. 创建 HTTP server + WebSocketServer（共享端口）
 
 ### API Endpoints
 
 | Method | Path | Auth | 描述 |
 |---|---|---|---|
-| POST | `/api/auth/login` | 无 | 密码 bcrypt 比对，返回 JWT |
+| POST | `/api/auth/login` | 无 | 密码 bcrypt 比对，返回 accessToken + refreshToken + token（兼容）+ expiresIn |
+| POST | `/api/auth/refresh` | 无 | refreshToken body 换新 access+refresh 对；rotation + reuse detection |
+| POST | `/api/auth/revoke` | 无（body refreshToken） | 撤销指定 refreshToken；空 body 返回 400 |
 | **窗口 / 会话** | | | |
 | GET | `/api/sessions` | Bearer | tmux list-windows（指定 session） |
 | POST | `/api/sessions` | Bearer | tmux new-window（claude/bash/profile） |
@@ -91,6 +94,52 @@ Telegram Bot（可选）
 | POST | `/api/webhooks/telegram` | 无（secret check） | Telegram Bot webhook |
 | GET | `/api/telegram/setup` | Bearer | Telegram Bot 状态信息 |
 | GET | `*` | 无 | SPA fallback → index.html |
+
+### 认证层（v2 双 token，规格 / 未部署）
+
+v1 的单一 30d JWT 升级为 access/refresh 双 token 模式。
+
+#### Token 生命周期
+
+```
+POST /api/auth/login
+  → bcrypt 比对 ACC_PASSWORD_HASH
+  → 生成 accessToken（JWT, 15min, sub=nexus-user, jti=uuid）
+  → 生成 refreshToken（crypto.randomBytes(48) → base64url）
+  → 创建 family（uuid v4），写入 data/auth/refresh-tokens.json
+     sha256(refreshToken) → { status: "active", createdAt, expiresAt }
+  → 返回 { accessToken, refreshToken, expiresIn: 900, token }
+
+POST /api/auth/refresh
+  → 验证 refreshToken body 存在
+  → sha256(refreshToken) 查找 data/auth/refresh-tokens.json
+  → 若 token.status !== "active" → 401
+    → 若 token.status === "used" → reuse detected → family 全部 revoke → 401 token_reused
+  → 若 token.expiresAt < now → 401 invalid_refresh_token
+  → 标记旧 token status = "used"
+  → 生成新 accessToken + 新 refreshToken（同一 family）
+  → 新 refreshToken sha256 写入 family，status = "active"
+  → 返回 { accessToken, refreshToken, expiresIn: 900, token }
+
+POST /api/auth/revoke
+  → 验证 refreshToken body 存在；空 body 返回 400
+  → sha256 查找并标记 status = "revoked"
+  → 不要求 Bearer accessToken，因为登出时 access token 可能已经过期
+  → 返回 { message: "token_revoked" }
+```
+
+#### 中间件
+
+- `authenticateToken(req, res, next)` — 现有 Bearer JWT 验证中间件不变；仅 JWT 验证逻辑中 `expiresIn` 从 30d 缩短为 15min
+- WebSocket `verifyClient` — 从 URL query `token` 提取 accessToken，JWT 验证；不支持 refreshToken 建连
+
+#### 安全边界
+
+- `data/auth/` 目录权限 0700，`refresh-tokens.json` 权限 0600
+- 写入使用 tmp + rename 原子操作
+- 服务端只存 sha256 哈希，原始 refreshToken 从不落盘
+- 启动时自动清理过期 token entries 和空 family entries
+- Web 路由层应拒绝 `/api/auth/refresh-tokens` 或 `data/auth/` 的直接访问
 
 ### PTY 层（ptyMap 多实例）
 
@@ -238,6 +287,8 @@ Effect B [token, activeWindowIndex] — 管理 WebSocket（窗口切换时重建
 data/
 ├── toolbar-config.json    # 工具栏布局（所有设备共享）
 ├── tasks.json             # 任务历史（上限 200 条）
+├── auth/
+│   └── refresh-tokens.json  # refresh token family 持久化（sha256 hash，原子写 0600）
 └── configs/
     ├── profile-a.json     # claude 启动配置 profile
     └── profile-b.json
@@ -275,6 +326,8 @@ nexus/
 |---|---|---|---|
 | `JWT_SECRET` | ✓ | — | JWT 签名密钥（openssl rand -hex 32） |
 | `ACC_PASSWORD_HASH` | ✓ | — | bcrypt hash 的登录密码 |
+| `ACCESS_TOKEN_EXPIRY_SECONDS` | | `900` | access token 有效期（秒），默认 15min |
+| `REFRESH_TOKEN_EXPIRY_DAYS` | | `90` | refresh token 有效期（天） |
 | `TMUX_SESSION` | | `main` | 要 attach 的 tmux session 名 |
 | `WORKSPACE_ROOT` | | `/workspace` | 工作区根目录 |
 | `PORT` | | `59000` | 监听端口 |
@@ -307,3 +360,4 @@ nexus/
 | `server.js` | `telegramTargetWindow` 重启后丢失，不持久化 | 低 |
 | `Terminal.tsx` | window 切换通过 `\x02{index}` 键序列，依赖 tmux 快捷键 | 低 |
 | `toolbarDefaults.ts` | 按键序列硬编码，无运行时验证 | 低 |
+| 认证 | v2 双 token 服务端/Web代码与自动化已完成但尚未部署；需preview验证旧客户端兼容、rotation/reuse/revoke及真实WS恢复 | 高 |

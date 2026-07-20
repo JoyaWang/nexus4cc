@@ -11,6 +11,7 @@ import GhostShield from './GhostShield'
 import { Icon } from './icons'
 import { getWindowStatus, STATUS_DOT_COLOR, STATUS_DOT_TITLE } from './windowStatus'
 import { apiFetch, handleAuthFailure } from './lib/api'
+import { refreshTokens, getAccessToken } from './lib/authSession'
 import { mapSpecialKey, shouldSkipInput } from './mobileInput'
 
 // ANSI 256-color palette (0-15 standard, 16-231 6x6x6 cube, 232-255 grayscale)
@@ -864,7 +865,7 @@ export default function Terminal({ token }: Props) {
       ? `/api/files/upload?overwrite=1&${sessionParam}`
       : `/api/files/upload?${sessionParam}`
     xhr.open('POST', url)
-    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.setRequestHeader('Authorization', `Bearer ${getAccessToken()}`)
     xhr.send(formData)
   }
 
@@ -1442,12 +1443,27 @@ export default function Terminal({ token }: Props) {
         if (!userScrolledRef.current) termRef.current?.scrollToBottom()
       }
 
-      newWs.onclose = (e) => {
+      newWs.onclose = async (e) => {
         if (intentionalClose) return
         if (e.code === 4001) {
-          writeTerm('\r\n\x1b[31m[Nexus: 登录已过期，正在返回登录页...]\x1b[0m\r\n')
-          handleAuthFailure()
-          return
+          writeTerm('\r\n\x1b[33m[Nexus: Token 过期，尝试刷新...]\x1b[0m\r\n')
+          try {
+            const { accessToken } = await refreshTokens()
+            const s = activeTmuxSessionRef.current
+            const wi = activeWindowIndexRef.current
+            const freshWs = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(accessToken)}&window=${wi}&session=${encodeURIComponent(s)}`)
+            wsRef.current = freshWs
+            freshWs.onopen = newWs.onopen
+            freshWs.onmessage = newWs.onmessage
+            freshWs.onclose = newWs.onclose
+            freshWs.onerror = newWs.onerror
+            writeTerm('\r\n\x1b[32m[Nexus: Token 刷新成功，已重连]\x1b[0m\r\n')
+            return
+          } catch {
+            writeTerm('\r\n\x1b[31m[Nexus: Token 刷新失败，返回登录页...]\x1b[0m\r\n')
+            handleAuthFailure()
+            return
+          }
         }
         if (reconnectAttempts >= maxReconnectAttempts) {
           writeTerm('\r\n\x1b[31m[Nexus: 重连失败，请刷新页面]\x1b[0m\r\n')
