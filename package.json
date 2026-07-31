@@ -6,7 +6,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "setup": "node scripts/setup.js",
-    "test": "node --test test/auth.test.js test/frontend-auth.test.js test/resizePolicy.test.js test/serverIntegration.test.js"
+    "test": "node --test test/auth.test.js test/frontend-auth.test.js test/resizePolicy.test.js test/ptyTarget.test.js test/serverIntegration.test.js"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

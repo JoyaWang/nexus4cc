@@ -16,6 +16,12 @@ import {
   activeClientSizes,
   computeMinSize,
 } from './server/resizePolicy.js';
+import {
+  isNexusLinkedSession,
+  linkedSessionName,
+  parseWindowIndex,
+  summarizeTerminalInput,
+} from './server/ptyTarget.js';
 import { verifyAccessToken } from './server/auth/tokens.js';
 import { createAuthService, mountRoutes as mountAuthRoutes } from './server/auth/authService.js';
 
@@ -1047,7 +1053,7 @@ app.get('/api/tmux-sessions', authMiddleware, (req, res) => {
     const sessions = stdout.trim().split('\n').filter(Boolean).map(line => {
       const [name, windows, attached] = line.split('|')
       return { name, windows: Number(windows), attached: Number(attached) > 0 }
-    })
+    }).filter(session => !isNexusLinkedSession(session.name))
     res.json(sessions)
   })
 })
@@ -1124,7 +1130,7 @@ app.get('/api/projects', authMiddleware, (req, res) => {
         active: name === TMUX_SESSION,
         channelCount: Number(windows) || 0
       }
-    })
+    }).filter(project => !isNexusLinkedSession(project.name))
     projects.reverse()
     res.json(projects)
   })
@@ -1922,91 +1928,209 @@ app.get('*', (req, res) => {
   });
 });
 
-// PTY 多实例管理（F-11/F-18：每个 session:window 独立 PTY）
-const ptyMap = new Map(); // "session:windowIndex" -> { pty, clients: Set<ws>, lastOutput, lastActivity }
+// PTY 多实例管理（F-11/F-18：每个 source session:window 独立 PTY）。
+// A PTY must attach through a linked tmux session: attaching several clients
+// directly to the same source session shares that session's current-window
+// state, so selecting esp32:0 can silently move every client to MoCode:7.
+const ptyMap = new Map(); // "sourceSession:windowIndex" -> entry
+let wsConnectionSequence = 0;
 
 function ptyKey(session, windowIndex) {
   return `${session}:${windowIndex}`;
 }
 
-function ensureWindowPty(session, windowIndex) {
-  // Validate session exists as a real tmux session (execFileSync avoids shell expansion)
-  let safeSession = session;
+class PtyTargetError extends Error {
+  constructor(code, message, fields = {}) {
+    super(message);
+    this.name = 'PtyTargetError';
+    this.code = code;
+    this.fields = fields;
+  }
+}
+
+function resolveTmuxWindow(session, windowIndex) {
   try {
     execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe' });
   } catch {
-    // Requested session doesn't exist — fall back to default TMUX_SESSION
-    safeSession = TMUX_SESSION;
-    try {
-      execFileSync('tmux', ['has-session', '-t', TMUX_SESSION], { stdio: 'pipe' });
-    } catch {
-      // Default session also missing — create it
-      try { execFileSync('tmux', ['new-session', '-d', '-s', TMUX_SESSION, '-n', 'shell', INTERACTIVE_SHELL], { stdio: 'pipe' }); } catch {}
-    }
+    throw new PtyTargetError('session_not_found', `tmux session not found: ${session}`, {
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+    });
   }
 
-  const key = ptyKey(safeSession, windowIndex);
-  if (ptyMap.has(key)) return { key, entry: ptyMap.get(key) };
-
-  // 检查窗口是否存在，不存在则 fallback 到第一个可用窗口
-  let targetWindow = windowIndex;
+  let output;
   try {
-    const out = execFileSync('tmux', ['list-windows', '-t', safeSession, '-F', '#I'], { encoding: 'utf8', stdio: 'pipe' });
-    const windows = out.trim().split('\n');
-    if (!windows.includes(String(windowIndex))) {
-      if (windows.length > 0) {
-        targetWindow = parseInt(windows[0], 10);
-      } else {
-        execFileSync('tmux', ['new-window', '-t', safeSession, '-n', 'shell', INTERACTIVE_SHELL], { stdio: 'pipe' });
-        targetWindow = 0;
-      }
-    }
+    output = execFileSync(
+      'tmux',
+      [
+        'display-message',
+        '-p',
+        '-t',
+        `${session}:${windowIndex}`,
+        '#{window_index}|#{window_id}|#{window_name}|#{pane_id}|#{pane_current_path}',
+      ],
+      { encoding: 'utf8', stdio: 'pipe' },
+    ).trim();
   } catch {
-    targetWindow = 0;
+    throw new PtyTargetError('window_not_found', `tmux window not found: ${session}:${windowIndex}`, {
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+    });
   }
 
-  const actualKey = ptyKey(safeSession, targetWindow);
-  if (ptyMap.has(actualKey)) return { key: actualKey, entry: ptyMap.get(actualKey) }; // reuse if fallback exists
+  const [actualIndexRaw, windowId, windowName, paneId, ...cwdParts] = output.split('|');
+  const actualWindowIndex = Number(actualIndexRaw);
+  if (!Number.isInteger(actualWindowIndex) || actualWindowIndex !== windowIndex || !windowId) {
+    throw new PtyTargetError('window_identity_mismatch', `tmux resolved an unexpected window for ${session}:${windowIndex}`, {
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+      actualWindowIndex,
+      windowId: windowId || null,
+    });
+  }
+  return {
+    session,
+    windowIndex: actualWindowIndex,
+    windowId,
+    windowName,
+    paneId,
+    cwd: cwdParts.join('|'),
+  };
+}
+
+function killLinkedSession(linkedSession) {
+  if (!linkedSession) return;
+  try {
+    execFileSync('tmux', ['kill-session', '-t', linkedSession], { stdio: 'pipe' });
+  } catch { /* already gone */ }
+}
+
+function disposePtyEntry(key, entry) {
+  try { entry?.pty?.kill(); } catch {}
+  killLinkedSession(entry?.linkedSession);
+  ptyMap.delete(key);
+}
+
+function ensureWindowPty(session, windowIndex, connectionId) {
+  const target = resolveTmuxWindow(session, windowIndex);
+  const key = ptyKey(session, windowIndex);
+  const cached = ptyMap.get(key);
+  if (cached && cached.windowId === target.windowId) {
+    console.log(JSON.stringify({
+      event: 'nexus.pty.cache_hit',
+      connectionId,
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+      actualSession: target.session,
+      actualWindowIndex: target.windowIndex,
+      windowId: target.windowId,
+      linkedSession: cached.linkedSession,
+      clients: cached.clients.size,
+    }));
+    return { key, entry: cached, target, cacheHit: true };
+  }
+  if (cached) {
+    console.warn(JSON.stringify({
+      event: 'nexus.pty.stale_cache_evicted',
+      connectionId,
+      key,
+      cachedWindowId: cached.windowId,
+      actualWindowId: target.windowId,
+    }));
+    disposePtyEntry(key, cached);
+  }
+
+  const linkedSession = linkedSessionName(session, target.windowId);
+  killLinkedSession(linkedSession);
+  try {
+    execFileSync('tmux', ['new-session', '-d', '-s', linkedSession, '-t', session], { stdio: 'pipe' });
+    execFileSync('tmux', ['select-window', '-t', `${linkedSession}:${windowIndex}`], { stdio: 'pipe' });
+  } catch (err) {
+    killLinkedSession(linkedSession);
+    throw new PtyTargetError('linked_session_failed', `failed to isolate tmux target ${session}:${windowIndex}`, {
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+      windowId: target.windowId,
+      errorType: err?.constructor?.name || 'Error',
+    });
+  }
 
   let ptyProc;
   try {
-    ptyProc = pty.spawn('tmux', ['attach-session', '-t', `${safeSession}:${targetWindow}`], {
+    ptyProc = pty.spawn('tmux', ['attach-session', '-t', linkedSession], {
       name: 'xterm-256color',
       cols: 120,
       rows: 30,
       env: { ...process.env, LANG: 'C.UTF-8', TERM: 'xterm-256color' },
     });
   } catch (err) {
-    console.error(`pty.spawn failed for ${safeSession}:${targetWindow}:`, err.message);
-    return { key: actualKey, entry: { pty: null, clients: new Set(), clientSizes: new Map(), clientModes: new Map(), lastOutput: '', lastActivity: Date.now() } };
+    killLinkedSession(linkedSession);
+    throw new PtyTargetError('pty_spawn_failed', `pty.spawn failed for ${session}:${windowIndex}`, {
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+      windowId: target.windowId,
+      errorType: err?.constructor?.name || 'Error',
+    });
   }
 
-  const entry = { pty: ptyProc, clients: new Set(), clientSizes: new Map(), clientModes: new Map(), lastOutput: '', lastActivity: Date.now() };
-  ptyMap.set(actualKey, entry);
+  const entry = {
+    pty: ptyProc,
+    clients: new Set(),
+    clientSizes: new Map(),
+    clientModes: new Map(),
+    lastOutput: '',
+    lastActivity: Date.now(),
+    sourceSession: session,
+    windowIndex,
+    windowId: target.windowId,
+    windowName: target.windowName,
+    paneId: target.paneId,
+    cwd: target.cwd,
+    linkedSession,
+  };
+  ptyMap.set(key, entry);
+  console.log(JSON.stringify({
+    event: 'nexus.pty.created',
+    connectionId,
+    requestedSession: session,
+    requestedWindowIndex: windowIndex,
+    actualSession: target.session,
+    actualWindowIndex: target.windowIndex,
+    windowId: target.windowId,
+    windowName: target.windowName,
+    paneId: target.paneId,
+    cwd: target.cwd,
+    linkedSession,
+  }));
 
   ptyProc.onData((data) => {
-    const ent = ptyMap.get(actualKey);
+    const ent = ptyMap.get(key);
     if (!ent) return;
     ent.lastOutput = (ent.lastOutput + data).slice(-10000);
     ent.lastActivity = Date.now();
     for (const ws of ent.clients) {
-      if (ws.readyState === 1) ws.send(data);
+      if (ws.readyState === 1) {
+        if (!ws.nexusFirstOutputLogged) {
+          ws.nexusFirstOutputLogged = true;
+          console.log(JSON.stringify({
+            event: 'nexus.ws.first_output',
+            connectionId: ws.nexusConnectionId,
+            actualKey: key,
+            byteLength: Buffer.byteLength(data, 'utf8'),
+          }));
+        }
+        ws.send(data);
+      }
     }
   });
 
   ptyProc.onExit(({ exitCode }) => {
-    console.log(`PTY ${actualKey} exited with code ${exitCode}`);
-    ptyMap.delete(actualKey);
-    // 如果 window 还在，重新创建
-    try {
-      const list = execFileSync('tmux', ['list-windows', '-t', safeSession, '-F', '#I'], { encoding: 'utf8', stdio: 'pipe' }).trim().split('\n');
-      if (list.includes(String(targetWindow))) {
-        setTimeout(() => ensureWindowPty(safeSession, targetWindow), 100);
-      }
-    } catch {}
+    console.log(JSON.stringify({ event: 'nexus.pty.exited', key, exitCode, linkedSession }));
+    ptyMap.delete(key);
+    killLinkedSession(linkedSession);
   });
 
-  return { key: actualKey, entry };
+  return { key, entry, target, cacheHit: false };
 }
 
 // WebSocket 服务 — 支持 /ws?token=xxx&window=<index>
@@ -2014,11 +2138,12 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
+  const connectionId = `ws-${Date.now().toString(36)}-${++wsConnectionSequence}`;
   const url = new URL(req.url, 'http://x');
   const token = url.searchParams.get('token');
-  const windowParam = url.searchParams.get('window') || '0';
-  const windowIndex = parseInt(windowParam, 10) || 0;
-  const session = url.searchParams.get('session') || TMUX_SESSION;
+  const windowParam = url.searchParams.get('window');
+  const parsedWindow = parseWindowIndex(windowParam);
+  const session = url.searchParams.get('session');
   // Phase 2 resize isolation: passive clients (e.g. Nexus Go mobile companion)
   // connect with `resizeMode=passive` and must not change the shared PTY size.
   // Default is ACTIVE so existing Web clients keep working unchanged.
@@ -2031,13 +2156,73 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  const { key, entry } = ensureWindowPty(session, windowIndex);
+  if (!session || !parsedWindow.ok) {
+    console.warn(JSON.stringify({
+      event: 'nexus.ws.target_rejected',
+      connectionId,
+      requestedSession: session || null,
+      requestedWindowRaw: windowParam,
+      reason: !session ? 'missing_session' : parsedWindow.reason,
+    }));
+    ws.close(4400, !session ? 'missing-session' : parsedWindow.reason);
+    return;
+  }
+  const windowIndex = parsedWindow.value;
+  console.log(JSON.stringify({
+    event: 'nexus.ws.connect_attempt',
+    connectionId,
+    requestedSession: session,
+    requestedWindowIndex: windowIndex,
+    resizeMode,
+  }));
+
+  let resolved;
+  try {
+    resolved = ensureWindowPty(session, windowIndex, connectionId);
+  } catch (err) {
+    const code = err instanceof PtyTargetError ? err.code : 'pty_target_failed';
+    console.warn(JSON.stringify({
+      event: 'nexus.ws.target_rejected',
+      connectionId,
+      requestedSession: session,
+      requestedWindowIndex: windowIndex,
+      reason: code,
+      ...(err instanceof PtyTargetError ? err.fields : { errorType: err?.constructor?.name || 'Error' }),
+    }));
+    ws.close(4404, code);
+    return;
+  }
+  const { key, entry, target, cacheHit } = resolved;
+  ws.nexusConnectionId = connectionId;
+  ws.nexusFirstOutputLogged = false;
   entry.clients.add(ws);
   entry.clientModes.set(ws, resizeMode);
-  console.log(`Client connected to ${key} (clients: ${entry.clients.size}, resizeMode: ${resizeMode})`);
+  console.log(JSON.stringify({
+    event: 'nexus.ws.target_resolved',
+    connectionId,
+    requestedSession: session,
+    requestedWindowIndex: windowIndex,
+    actualSession: target.session,
+    actualWindowIndex: target.windowIndex,
+    actualKey: key,
+    windowId: target.windowId,
+    windowName: target.windowName,
+    linkedSession: entry.linkedSession,
+    cacheHit,
+    clients: entry.clients.size,
+    resizeMode,
+  }));
 
   // Send recent output so the screen isn't blank while waiting for the first repaint.
   if (entry.lastOutput) {
+    ws.nexusFirstOutputLogged = true;
+    console.log(JSON.stringify({
+      event: 'nexus.ws.first_output',
+      connectionId,
+      actualKey: key,
+      byteLength: Buffer.byteLength(entry.lastOutput.slice(-2000), 'utf8'),
+      source: 'cache',
+    }));
     ws.send(entry.lastOutput.slice(-2000));
   }
 
@@ -2065,7 +2250,18 @@ wss.on('connection', (ws, req) => {
     // Write for all non-resize messages. Previously only the catch branch wrote,
     // which silently dropped single-digit strings ('1'..'9','0') since
     // JSON.parse('1') succeeds without throwing.
-    if (!isResize) ent.pty.write(str);
+    if (!isResize) {
+      const summary = summarizeTerminalInput(str);
+      if (summary.kind !== 'text' || process.env.NEXUS_TERMINAL_DEBUG === '1') {
+        console.log(JSON.stringify({
+          event: 'nexus.pty.input',
+          connectionId,
+          actualKey: key,
+          ...summary,
+        }));
+      }
+      ent.pty.write(str);
+    }
   });
 
   ws.on('close', () => {
@@ -2074,7 +2270,12 @@ wss.on('connection', (ws, req) => {
       ent.clients.delete(ws);
       ent.clientSizes.delete(ws);
       ent.clientModes.delete(ws);
-      console.log(`Client disconnected from ${key} (clients: ${ent.clients.size})`);
+      console.log(JSON.stringify({
+        event: 'nexus.ws.disconnected',
+        connectionId,
+        actualKey: key,
+        clients: ent.clients.size,
+      }));
       // Recompute minimum size across REMAINING ACTIVE clients only.
       // Passive clients never participate in recomputation — their disconnect
       // must not change the shared PTY size either.
@@ -2087,9 +2288,13 @@ wss.on('connection', (ws, req) => {
       setTimeout(() => {
         const e = ptyMap.get(key);
         if (e && e.clients.size === 0 && Date.now() - e.lastActivity > 300000) {
-          e.pty.kill();
-          ptyMap.delete(key);
-          console.log(`PTY ${key} cleaned up (idle)`);
+          disposePtyEntry(key, e);
+          console.log(JSON.stringify({
+            event: 'nexus.pty.cleaned',
+            actualKey: key,
+            linkedSession: e.linkedSession,
+            reason: 'idle',
+          }));
         }
       }, 300000);
     }
