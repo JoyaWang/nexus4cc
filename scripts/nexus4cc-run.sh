@@ -5,6 +5,11 @@
 set -Eeuo pipefail
 
 export PATH="/opt/homebrew/bin:/Users/joya/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd does not inherit the interactive shell locale. Without an explicit
+# UTF-8 locale, tmux clients replace CJK window names with underscores even
+# though the API and tmux server both accept the Unicode bytes.
+export LANG="C.UTF-8"
+export LC_ALL="C.UTF-8"
 
 NEXUS_DIR="${NEXUS_DIR:-/Users/joya/JoyaProjects/nexus4cc}"
 cd "$NEXUS_DIR"
