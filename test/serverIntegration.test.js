@@ -95,3 +95,36 @@ test('server.js no longer uses jwt.verify directly', () => {
 test('server.js no longer uses jwt.sign directly', () => {
   assert.ok(!serverSrc.match(/jwt\.sign/), 'server.js must not use jwt.sign directly');
 });
+
+// ---- strict per-window PTY target guards ----
+
+test('server.js attaches PTYs through per-window linked tmux sessions', () => {
+  assert.match(serverSrc, /linkedSessionName\(session,\s*target\.windowId\)/);
+  assert.match(serverSrc, /new-session['"],\s*['"]-d['"],\s*['"]-s['"],\s*linkedSession,\s*['"]-t['"],\s*session/);
+  assert.match(serverSrc, /select-window['"],\s*['"]-t['"],\s*`\$\{linkedSession\}:\$\{windowIndex\}`/);
+  assert.match(serverSrc, /attach-session['"],\s*['"]-t['"],\s*linkedSession/);
+});
+
+test('server.js rejects missing targets instead of falling back to default or first window', () => {
+  const targetBlock = serverSrc.match(/function resolveTmuxWindow[\s\S]*?function ensureWindowPty[\s\S]*?\n}\n\n\/\/ WebSocket/);
+  assert.ok(targetBlock, 'target resolution and ensureWindowPty blocks must exist');
+  assert.doesNotMatch(targetBlock[0], /safeSession\s*=\s*TMUX_SESSION/);
+  assert.doesNotMatch(targetBlock[0], /targetWindow\s*=\s*parseInt\(windows\[0\]/);
+  assert.match(targetBlock[0], /session_not_found/);
+  assert.match(targetBlock[0], /window_not_found/);
+  assert.match(serverSrc, /ws\.close\(4404,\s*code\)/);
+});
+
+test('server.js records requested and actual target identity', () => {
+  assert.match(serverSrc, /event:\s*['"]nexus\.ws\.connect_attempt['"]/);
+  assert.match(serverSrc, /event:\s*['"]nexus\.ws\.target_resolved['"]/);
+  assert.match(serverSrc, /requestedSession:\s*session/);
+  assert.match(serverSrc, /requestedWindowIndex:\s*windowIndex/);
+  assert.match(serverSrc, /actualSession:\s*target\.session/);
+  assert.match(serverSrc, /actualWindowIndex:\s*target\.windowIndex/);
+});
+
+test('server.js hides internal linked sessions from public session lists', () => {
+  assert.match(serverSrc, /filter\(session => !isNexusLinkedSession\(session\.name\)\)/);
+  assert.match(serverSrc, /filter\(project => !isNexusLinkedSession\(project\.name\)\)/);
+});
