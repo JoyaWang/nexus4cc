@@ -128,3 +128,33 @@ test('server.js hides internal linked sessions from public session lists', () =>
   assert.match(serverSrc, /filter\(session => !isNexusLinkedSession\(session\.name\)\)/);
   assert.match(serverSrc, /filter\(project => !isNexusLinkedSession\(project\.name\)\)/);
 });
+
+// ---- liveness + lifecycle hardening guards ----
+
+test('channels API exposes pane_current_command as cmd for liveness display', () => {
+  assert.match(serverSrc, /pane_current_command/);
+  assert.match(serverSrc, /const cmd = parts\[4\] \|\| ''/);
+  assert.match(serverSrc, /return \{ index, name, active, cwd, cmd \}/);
+});
+
+test('delete project kills linked sessions so windows cannot zombify', () => {
+  const block = serverSrc.match(/app\.delete\('\/api\/projects\/:name'[\s\S]*?\n\}\)/);
+  assert.ok(block, 'delete project route must exist');
+  assert.match(block[0], /killLinkedSessionsFor\(sessionName\)/);
+});
+
+test('killLinkedSessionsFor disposes ptyMap entries and group-matched tmux leaks', () => {
+  assert.match(serverSrc, /entry\.sourceSession === sourceSession\) disposePtyEntry/);
+  assert.match(serverSrc, /group === sourceSession && isNexusLinkedSession\(name\)/);
+});
+
+test('delete window disposes the matching PTY entry and linked session', () => {
+  const block = serverSrc.match(/app\.delete\('\/api\/sessions\/:id'[\s\S]*?\n\}\)/);
+  assert.ok(block, 'delete session route must exist');
+  assert.match(block[0], /disposePtyEntry\(key, entry\)/);
+});
+
+test('ensureWindowPty evicts stale PTY when the target window is dead', () => {
+  assert.match(serverSrc, /nexus\.pty\.dead_window_evicted/);
+  assert.match(serverSrc, /disposePtyEntry\(ptyKey\(session, windowIndex\), stale\)/);
+});
