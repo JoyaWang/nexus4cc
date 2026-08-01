@@ -1164,7 +1164,7 @@ app.get('/api/session-cwd', authMiddleware, (req, res) => {
 app.get('/api/projects/:name/channels', authMiddleware, (req, res) => {
   const sessionName = req.params.name
   exec(
-    `tmux list-windows -t ${sessionName} -F "#{window_index}|#{window_name}|#{window_active}|#{pane_current_path}"`,
+    `tmux list-windows -t ${sessionName} -F "#{window_index}|#{window_name}|#{window_active}|#{pane_current_path}|#{pane_current_command}"`,
     (err, stdout) => {
       if (err) return res.status(500).json({ error: err.message })
       const lines = stdout.trim().split('\n').filter(Boolean)
@@ -1173,8 +1173,9 @@ app.get('/api/projects/:name/channels', authMiddleware, (req, res) => {
         const index = Number(parts[0])
         const name = parts[1]
         const active = parts[2]?.trim() === '1'
-        const cwd = parts.slice(3).join(':') || ''
-        return { index, name, active, cwd }
+        const cwd = parts[3] || ''
+        const cmd = parts[4] || ''
+        return { index, name, active, cwd, cmd }
       })
       // 新创建的频道排在上面
       channels.reverse()
@@ -1430,7 +1431,9 @@ app.delete('/api/projects/:name', authMiddleware, (req, res) => {
   } catch {
     return res.status(404).json({ error: 'project not found' })
   }
-  // kill session
+  // kill session。连带清理：linked session 会抱住整个 window group，
+  // 只 kill 源 session 会让全部 window 变成不可见僵尸（已实验证明）。
+  killLinkedSessionsFor(sessionName)
   exec(`tmux kill-session -t ${sessionName}`, (err) => {
     if (err) return res.status(500).json({ error: err.message })
     res.json({ ok: true })
@@ -1463,19 +1466,21 @@ app.delete('/api/sessions/:id', authMiddleware, (req, res) => {
   // window before killing so the tmux session is not destroyed.
   exec(`tmux list-windows -t ${session} -F "#{window_index}" 2>/dev/null | wc -l`, (countErr, countOut) => {
     const windowCount = parseInt(countOut.trim()) || 0
+    const afterKill = (err, res2) => {
+      if (err) return res2.status(500).json({ error: err.message })
+      // 释放该 window 的 PTY 与 linked session，避免旧 attach 继续占用。
+      const key = ptyKey(session, Number(index))
+      const entry = ptyMap.get(key)
+      if (entry) disposePtyEntry(key, entry)
+      res2.json({ ok: true })
+    }
     if (windowCount <= 1) {
       // Last window: create a new shell first to keep the session alive
       exec(`tmux new-window -t ${session} -n shell "${INTERACTIVE_SHELL}"`, () => {
-        exec(`tmux kill-window -t ${session}:${index}`, (err) => {
-          if (err) return res.status(500).json({ error: err.message })
-          res.json({ ok: true })
-        })
+        exec(`tmux kill-window -t ${session}:${index}`, (err) => afterKill(err, res))
       })
     } else {
-      exec(`tmux kill-window -t ${session}:${index}`, (err) => {
-        if (err) return res.status(500).json({ error: err.message })
-        res.json({ ok: true })
-      })
+      exec(`tmux kill-window -t ${session}:${index}`, (err) => afterKill(err, res))
     }
   })
 })
@@ -2005,6 +2010,30 @@ function killLinkedSession(linkedSession) {
   } catch { /* already gone */ }
 }
 
+// 杀掉属于某个 source session 的全部 linked session（含 ptyMap 之外的泄漏）。
+// linked session 与 source 同属一个 session group，按 group 精确匹配，
+// 不能靠名字猜（hash 无法反推 windowId）。
+function killLinkedSessionsFor(sourceSession) {
+  // 1. ptyMap 里的活条目
+  for (const [key, entry] of [...ptyMap.entries()]) {
+    if (entry.sourceSession === sourceSession) disposePtyEntry(key, entry);
+  }
+  // 2. tmux 里可能残留（如 server 重启前创建）的 linked session
+  try {
+    const out = execFileSync(
+      'tmux',
+      ['list-sessions', '-F', '#{session_name}|#{session_group}'],
+      { encoding: 'utf8', stdio: 'pipe' },
+    );
+    for (const line of out.trim().split('\n')) {
+      const [name, group] = line.split('|');
+      if (name && group === sourceSession && isNexusLinkedSession(name)) {
+        killLinkedSession(name);
+      }
+    }
+  } catch { /* tmux 不可用则跳过，不阻塞删除 */ }
+}
+
 function disposePtyEntry(key, entry) {
   try { entry?.pty?.kill(); } catch {}
   killLinkedSession(entry?.linkedSession);
@@ -2012,7 +2041,25 @@ function disposePtyEntry(key, entry) {
 }
 
 function ensureWindowPty(session, windowIndex, connectionId) {
-  const target = resolveTmuxWindow(session, windowIndex);
+  let target;
+  try {
+    target = resolveTmuxWindow(session, windowIndex);
+  } catch (err) {
+    // 目标 window 已死：把对应旧 PTY + linked session 一并清掉，
+    // 否则旧 attach 会抱着 linked session 永远泄漏。
+    const stale = ptyMap.get(ptyKey(session, windowIndex));
+    if (stale) {
+      console.warn(JSON.stringify({
+        event: 'nexus.pty.dead_window_evicted',
+        connectionId,
+        requestedSession: session,
+        requestedWindowIndex: windowIndex,
+        linkedSession: stale.linkedSession,
+      }));
+      disposePtyEntry(ptyKey(session, windowIndex), stale);
+    }
+    throw err;
+  }
   const key = ptyKey(session, windowIndex);
   const cached = ptyMap.get(key);
   if (cached && cached.windowId === target.windowId) {
