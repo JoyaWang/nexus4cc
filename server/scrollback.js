@@ -183,10 +183,17 @@ export function capturePane({ target, lines, start, execFileFn = defaultExecFile
   const captureStart = start ?? (lines === undefined ? FULL_HISTORY_CAPTURE_START : `-${lines}`);
   const options = { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 };
   return new Promise((resolve, reject) => {
-    execFileFn('tmux', ['display', '-p', '-t', paneTarget, '#{pane_height}'], options, (displayError, displayOutput) => {
-      const paneHeight = Number.parseInt(String(displayOutput ?? '').trim(), 10) || 50;
+    execFileFn('tmux', ['display', '-p', '-t', paneTarget, '#{pane_height}|#{history_limit}'], options, (displayError, displayOutput) => {
+      const [heightRaw, historyLimitRaw] = String(displayOutput ?? '').trim().split('|');
+      const paneHeight = Number.parseInt(heightRaw, 10) || 50;
+      const historyLimit = Number.parseInt(historyLimitRaw, 10) || 0;
       if (displayError) return reject(displayError);
-      execFileFn('tmux', ['capture-pane', '-e', '-p', '-S', captureStart, '-t', paneTarget], options, (captureError, output) => {
+      // tmux 3.5a 会把 `capture-pane -S -` 解析成 `-S -0`（只捕获当前屏幕，不含 scrollback），
+      // 所以“全部历史”必须显式展开为 `-S -<history_limit>`；超出历史起点时 tmux 会自动从起点截断，无副作用。
+      const effectiveStart = captureStart === FULL_HISTORY_CAPTURE_START
+        ? `-${Math.max(historyLimit, 1)}`
+        : captureStart;
+      execFileFn('tmux', ['capture-pane', '-e', '-p', '-S', effectiveStart, '-t', paneTarget], options, (captureError, output) => {
         if (captureError) return reject(captureError);
         resolve({ content: String(output ?? ''), paneHeight });
       });
@@ -194,49 +201,13 @@ export function capturePane({ target, lines, start, execFileFn = defaultExecFile
   });
 }
 
-// Remove repeated pane-height frames from full-screen apps without altering line whitespace.
-export function dedupScrollback(lines, paneHeight) {
-  if (lines.length <= paneHeight * 2) return lines;
-
-  const stripAnsi = value => value.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]/g, '');
-  const scrollbackEnd = lines.length - paneHeight;
-  const lineHashes = new Int32Array(lines.length);
-  for (let i = 0; i < lines.length; i++) {
-    const value = stripAnsi(lines[i]);
-    let hash = 5381;
-    for (let j = 0; j < value.length; j++) hash = ((hash << 5) + hash + value.charCodeAt(j)) | 0;
-    lineHashes[i] = hash;
-  }
-
-  const blockFingerprint = start => {
-    let fingerprint = 0;
-    for (let i = start; i < start + paneHeight && i < lines.length; i++) {
-      fingerprint = (fingerprint * 31 + lineHashes[i]) | 0;
-    }
-    return fingerprint;
-  };
-
-  const seen = new Map();
-  const duplicates = [];
-  for (let i = 0; i <= scrollbackEnd - paneHeight; i += paneHeight) {
-    const fingerprint = blockFingerprint(i);
-    if (seen.has(fingerprint)) {
-      const previous = seen.get(fingerprint);
-      const step = Math.max(1, paneHeight >> 3);
-      let match = true;
-      for (let j = 0; j < paneHeight; j += step) {
-        if (lineHashes[previous + j] !== lineHashes[i + j]) { match = false; break; }
-      }
-      if (match) duplicates.push(previous);
-    }
-    seen.set(fingerprint, i);
-  }
-  if (duplicates.length === 0) return lines;
-
-  const keep = new Uint8Array(lines.length).fill(1);
-  for (const start of duplicates) {
-    const end = Math.min(start + paneHeight, scrollbackEnd);
-    for (let i = start; i < end; i++) keep[i] = 0;
-  }
-  return lines.filter((_, index) => keep[index]);
+// capture-pane 的结果末尾总是包含“当前屏幕”的 paneHeight 行（实时终端里已可见）。
+// 历史记录里再包含它们会造成内容重复（见 docs/HISTORY_MODE_REDESIGN.md），因此剔除。
+// 注意：这也替代了旧 dedupScrollback 的职责——dedup 会把重复日志/滚动帧误删，
+// 且 tmux 的 alternate-screen（全屏应用）帧本就不写入 scrollback，删块去重毫无必要。
+export function stripCurrentPane(lines, paneHeight) {
+  const height = Number.isSafeInteger(paneHeight) && paneHeight > 0 ? paneHeight : 0;
+  if (height === 0) return [...lines];
+  if (lines.length <= height) return [];
+  return lines.slice(0, lines.length - height);
 }

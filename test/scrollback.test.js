@@ -4,10 +4,10 @@ import assert from 'node:assert/strict';
 import {
   ScrollbackStore,
   capturePane,
-  dedupScrollback,
   paginateLines,
   parseScrollbackParams,
   splitLogicalLines,
+  stripCurrentPane,
 } from '../server/scrollback.js';
 
 test('splitLogicalLines preserves trailing spaces and ANSI sequences', () => {
@@ -17,8 +17,17 @@ test('splitLogicalLines preserves trailing spaces and ANSI sequences', () => {
     '\x1b[31mred  \x1b[0m',
     'next  ',
   ]);
-  assert.deepEqual(dedupScrollback(splitLogicalLines(content), 20), splitLogicalLines(content));
   assert.deepEqual(splitLogicalLines('line  '), ['line  ']);
+});
+
+test('stripCurrentPane removes the trailing current-screen lines from a capture', () => {
+  const lines = ['a', 'b', 'c', 'd', 'e'];
+  assert.deepEqual(stripCurrentPane(lines, 2), ['a', 'b', 'c']);
+  assert.deepEqual(stripCurrentPane(lines, 10), []);
+  assert.deepEqual(stripCurrentPane(['a', 'b'], 2), []);
+  assert.deepEqual(stripCurrentPane(lines, 0), [...lines]);
+  assert.deepEqual(stripCurrentPane([], 2), []);
+  assert.deepEqual(stripCurrentPane(lines, -1), [...lines]);
 });
 
 test('paginateLines returns oldest content first and advances by logical lines', () => {
@@ -159,7 +168,7 @@ test('capturePane uses the stable pane identity, keeps -e, and does not trim pan
   const calls = [];
   const execFileFn = (command, args, options, callback) => {
     calls.push({ command, args, options });
-    if (args[0] === 'display') return callback(null, '24\n', '');
+    if (args[0] === 'display') return callback(null, '24|2000\n', '');
     callback(null, '\x1b[31mred  \n', '');
   };
 
@@ -177,11 +186,11 @@ test('capturePane uses the stable pane identity, keeps -e, and does not trim pan
   assert.equal(result.content, '\x1b[31mred  \n');
 });
 
-test('capturePane supports the tmux history-start marker for paginated captures', async () => {
+test('capturePane expands the history-start marker to the pane history limit', async () => {
   const calls = [];
   const execFileFn = (command, args, options, callback) => {
     calls.push(args);
-    if (args[0] === 'display') return callback(null, '24\n', '');
+    if (args[0] === 'display') return callback(null, '24|2000\n', '');
     callback(null, 'old\nnew', '');
   };
 
@@ -191,5 +200,32 @@ test('capturePane supports the tmux history-start marker for paginated captures'
     execFileFn,
   });
 
-  assert.deepEqual(calls[1], ['capture-pane', '-e', '-p', '-S', '-', '-t', '%4']);
+  assert.deepEqual(calls[1], ['capture-pane', '-e', '-p', '-S', '-2000', '-t', '%4']);
+});
+
+test('capturePane uses the history limit when no start or lines are given', async () => {
+  const calls = [];
+  const execFileFn = (command, args, options, callback) => {
+    calls.push(args);
+    if (args[0] === 'display') return callback(null, '30|5000\n', '');
+    callback(null, 'x\n', '');
+  };
+
+  await capturePane({
+    target: { session: 'safe-session', windowIndex: 4, windowId: '@4', paneId: '%4' },
+    execFileFn,
+  });
+
+  assert.deepEqual(calls[1], ['capture-pane', '-e', '-p', '-S', '-5000', '-t', '%4']);
+});
+
+test('capturePane rejects when the pane display query fails', async () => {
+  const execFileFn = (command, args, options, callback) => {
+    callback(new Error('tmux unavailable'), '', '');
+  };
+
+  await assert.rejects(
+    capturePane({ target: { paneId: '%4' }, execFileFn }),
+    /tmux unavailable/,
+  );
 });

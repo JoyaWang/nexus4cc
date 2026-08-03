@@ -31,10 +31,10 @@ import {
   MAX_LEGACY_CAPTURE_LINES,
   MAX_PAGE_LIMIT,
   capturePane,
-  dedupScrollback,
   paginateLines,
   parseScrollbackParams,
   splitLogicalLines,
+  stripCurrentPane,
 } from './server/scrollback.js';
 import {
   isNexusLinkedSession,
@@ -1074,7 +1074,7 @@ app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
       if (!sameTmuxTargetIdentity(currentTarget, resolvedTarget)) {
         return res.status(409).json({ error: 'scrollback_target_changed' });
       }
-      const lines = dedupScrollback(splitLogicalLines(content), paneHeight);
+      const lines = stripCurrentPane(splitLogicalLines(content), paneHeight);
       if (isLegacy) return res.json({ content: lines.join('\n') });
       const created = scrollbackStore.create(resolvedTarget, lines);
       return sendPage({ snapshotId: created.snapshotId, target: resolvedTarget, lines }, 0, requestedLimit);
@@ -2003,10 +2003,19 @@ class PtyTargetError extends Error {
   }
 }
 
-function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null) {
+// tmux 的 target 解析对 session 名做“唯一前缀”静默匹配（实测 zzonly → zzonly10）。
+// 本项目 session 名是数字（0-12，且列表会增删），前缀匹配是串会话风险，必须按精确名校验。
+function sessionExactNameExists(session) {
   try {
-    execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe' });
+    const out = execFileSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf8', stdio: 'pipe' });
+    return out.trim().split('\n').includes(session);
   } catch {
+    return false;
+  }
+}
+
+function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null) {
+  if (!sessionExactNameExists(session)) {
     throw new PtyTargetError('session_not_found', `tmux session not found: ${session}`, {
       requestedSession: session,
       requestedWindowIndex,
