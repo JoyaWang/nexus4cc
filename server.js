@@ -3,7 +3,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import * as pty from 'node-pty';
 import { createServer } from 'node:http';
-import { exec, spawn, execSync, execFileSync } from 'child_process';
+import { exec, spawn, execSync, execFile, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join, normalize, isAbsolute, basename } from 'path';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, statSync, rmdirSync, renameSync, cpSync, rmSync } from 'fs';
@@ -11,11 +11,31 @@ import { readdir, stat as statAsync } from 'fs/promises';
 import https from 'node:https';
 import multer from 'multer';
 import {
+  RESIZE_MODE,
   parseResizeMode,
   shouldResizePTY,
   activeClientSizes,
   computeMinSize,
+  normalizeResizeSize,
+  resizePlan,
+  shouldBroadcastPTYOutput,
 } from './server/resizePolicy.js';
+import {
+  appendAnsiOutput,
+  safeAnsiSuffix,
+  terminalModeSync,
+  updateAlternateScreenState,
+} from './server/terminalOutput.js';
+import {
+  ScrollbackStore,
+  MAX_LEGACY_CAPTURE_LINES,
+  MAX_PAGE_LIMIT,
+  capturePane,
+  dedupScrollback,
+  paginateLines,
+  parseScrollbackParams,
+  splitLogicalLines,
+} from './server/scrollback.js';
 import {
   isNexusLinkedSession,
   linkedSessionName,
@@ -123,6 +143,8 @@ const authService = createAuthService({
   refreshTokenExpiryDays: REFRESH_TOKEN_EXPIRY_DAYS,
   storePath: TOKEN_STORE_PATH,
 });
+
+const scrollbackStore = new ScrollbackStore();
 
 function commandExists(cmd) {
   try {
@@ -958,88 +980,116 @@ app.get('/api/sessions/:id/output', authMiddleware, (req, res) => {
   if (!entry) return res.json({ connected: false, output: '', clients: 0 });
   res.json({
     connected: true,
-    output: entry.lastOutput.slice(-2000), // 最后 2KB
+    output: safeAnsiSuffix(entry.lastOutput, 2000), // 最后 2KB，不能截断 ANSI token
     clients: entry.clients.size,
     idleMs: Date.now() - entry.lastActivity,
   });
 });
 
 // GET /api/sessions/:id/scrollback — fetch tmux scrollback history (works in alternate screen too)
-app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
-  const windowIndex = parseInt(req.params.id, 10)
-  const session = req.query.session || TMUX_SESSION
-  const lines = Math.min(parseInt(req.query.lines || '3000', 10), 10000)
-  const target = `${session}:${windowIndex}`
-
-  // Get pane height first, then capture content and dedup ghost frames
-  exec(`tmux display -p -t ${target} '#{pane_height}' 2>/dev/null`, (err, phOut) => {
-    const paneHeight = parseInt(phOut?.trim(), 10) || 50
-    exec(`tmux capture-pane -e -p -S -${lines} -t ${target} 2>/dev/null`, { maxBuffer: 5 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return res.status(500).json({ error: err.message })
-      const rawLines = stdout.split('\n').map(l => l.trimEnd())
-      const content = dedupScrollback(rawLines, paneHeight).join('\n')
-      res.json({ content })
-    })
-  })
-})
-
-// Remove "ghost frame" duplicates from scrollback caused by full-screen app re-renders.
-// Ghost frames are paneHeight-sized blocks pushed into scrollback when a full-screen app
-// redraws without alternate screen. Detection is purely content-based: hash each line,
-// compute rolling block fingerprints, and remove earlier duplicates. Zero hardcoded patterns.
-function dedupScrollback(lines, paneHeight) {
-  if (lines.length <= paneHeight * 2) return lines
-
-  const stripAnsi = s => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
-  const scrollbackEnd = lines.length - paneHeight
-
-  // Hash each line (stripped of ANSI), using djb2
-  const lineHashes = new Int32Array(lines.length)
-  for (let i = 0; i < lines.length; i++) {
-    const s = stripAnsi(lines[i])
-    let h = 5381
-    for (let c = 0; c < s.length; c++) h = ((h << 5) + h + s.charCodeAt(c)) | 0
-    lineHashes[i] = h
+function scrollbackErrorStatus(error) {
+  if (error instanceof PtyTargetError) {
+    if (error.code === 'session_not_found' || error.code === 'window_not_found') return 404;
+    if (error.code === 'window_identity_mismatch' || error.code === 'linked_window_identity_mismatch') return 409;
   }
-
-  // Block fingerprint: XOR of weighted line hashes over paneHeight lines
-  function blockFp(start) {
-    let fp = 0
-    for (let i = start; i < start + paneHeight && i < lines.length; i++) {
-      fp = (fp * 31 + lineHashes[i]) | 0
-    }
-    return fp
-  }
-
-  // Build map: fingerprint → last seen position (we keep the latest occurrence)
-  const seen = new Map()
-  const dupes = []
-
-  for (let i = 0; i <= scrollbackEnd - paneHeight; i += paneHeight) {
-    const fp = blockFp(i)
-    if (seen.has(fp)) {
-      // Verify: sample 8 lines to rule out hash collision
-      const prev = seen.get(fp)
-      const step = Math.max(1, paneHeight >> 3)
-      let match = true
-      for (let s = 0; s < paneHeight; s += step) {
-        if (lineHashes[prev + s] !== lineHashes[i + s]) { match = false; break }
-      }
-      if (match) dupes.push(prev)
-    }
-    seen.set(fp, i)
-  }
-
-  if (dupes.length === 0) return lines
-
-  const keep = new Uint8Array(lines.length).fill(1)
-  for (const start of dupes) {
-    const end = Math.min(start + paneHeight, scrollbackEnd)
-    for (let j = start; j < end; j++) keep[j] = 0
-  }
-
-  return lines.filter((_, idx) => keep[idx])
+  return 500;
 }
+
+function sameTmuxTargetIdentity(left, right) {
+  return Boolean(left && right)
+    && left.session === right.session
+    && left.windowIndex === right.windowIndex
+    && left.windowId === right.windowId
+    && left.paneId === right.paneId;
+}
+
+app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
+  const session = req.query.session || TMUX_SESSION
+  const parsedWindow = parseWindowIndex(req.params.id);
+  const params = parseScrollbackParams({
+    session,
+    windowIndex: parsedWindow.ok ? parsedWindow.value : -1,
+    lines: req.query.lines,
+    limit: req.query.limit,
+    offset: req.query.offset,
+    snapshot: req.query.snapshot,
+  });
+  if (!params.ok) return res.status(400).json({ error: params.error });
+
+  const { isLegacy, legacyLines, limit: requestedLimit, offset, snapshot: snapshotId } = params;
+  const windowIndex = parsedWindow.value;
+  let resolvedTarget;
+  try {
+    resolvedTarget = resolveTmuxWindow(session, windowIndex);
+  } catch (error) {
+    return res.status(scrollbackErrorStatus(error)).json({ error: error.code || 'scrollback_target_failed' });
+  }
+
+  const sendPage = (snapshot, pageOffset, limit) => {
+    if (pageOffset > snapshot.lines.length) {
+      return res.status(416).json({
+        error: 'scrollback offset exceeds snapshot',
+        snapshotId: snapshot.snapshotId,
+        totalLines: snapshot.lines.length,
+      });
+    }
+    const page = paginateLines(snapshot.lines, pageOffset, limit);
+    res.json({
+      content: page.content,
+      format: 'ansi',
+      ansiPreserved: true,
+      windowId: snapshot.target.windowId,
+      snapshotId: snapshot.snapshotId,
+      offset: page.offset,
+      returnedLines: page.returnedLines,
+      totalLines: page.totalLines,
+      hasMore: page.hasMore,
+      nextOffset: page.nextOffset,
+    });
+  };
+
+  if (snapshotId) {
+    const found = scrollbackStore.get(snapshotId, resolvedTarget);
+    if (!found.ok) return res.status(found.status).json({ error: found.code, snapshotId });
+    if (isLegacy) return res.json({ content: found.snapshot.lines.join('\n') });
+    return sendPage(found.snapshot, offset, requestedLimit);
+  }
+
+  if (!isLegacy && offset !== 0) {
+    return res.status(400).json({ error: 'snapshot required for non-zero offset' });
+  }
+
+  capturePane({
+    target: resolvedTarget,
+    start: isLegacy ? `-${legacyLines}` : '-',
+    execFileFn: execFile,
+  })
+    .then(({ content, paneHeight }) => {
+      let currentTarget;
+      try {
+        currentTarget = resolveTmuxWindow(session, windowIndex);
+      } catch (error) {
+        return res.status(scrollbackErrorStatus(error)).json({ error: error.code || 'scrollback_target_failed' });
+      }
+      if (!sameTmuxTargetIdentity(currentTarget, resolvedTarget)) {
+        return res.status(409).json({ error: 'scrollback_target_changed' });
+      }
+      const lines = dedupScrollback(splitLogicalLines(content), paneHeight);
+      if (isLegacy) return res.json({ content: lines.join('\n') });
+      const created = scrollbackStore.create(resolvedTarget, lines);
+      return sendPage({ snapshotId: created.snapshotId, target: resolvedTarget, lines }, 0, requestedLimit);
+    })
+    .catch(error => {
+      let status = 500;
+      try {
+        const currentTarget = resolveTmuxWindow(session, windowIndex);
+        if (!sameTmuxTargetIdentity(currentTarget, resolvedTarget)) status = 409;
+      } catch (targetError) {
+        status = scrollbackErrorStatus(targetError);
+      }
+      return res.status(status).json({ error: error.code || error.message || 'scrollback_capture_failed' });
+    });
+})
 
 // GET /api/config — 服务端配置信息（供前端初始化用）
 app.get('/api/config', authMiddleware, (req, res) => {
@@ -1953,54 +2003,89 @@ class PtyTargetError extends Error {
   }
 }
 
-function resolveTmuxWindow(session, windowIndex) {
+function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null) {
   try {
     execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe' });
   } catch {
     throw new PtyTargetError('session_not_found', `tmux session not found: ${session}`, {
       requestedSession: session,
-      requestedWindowIndex: windowIndex,
+      requestedWindowIndex,
     });
   }
 
-  let output;
+  let identityOutput;
   try {
-    output = execFileSync(
+    identityOutput = execFileSync(
       'tmux',
       [
         'display-message',
         '-p',
         '-t',
-        `${session}:${windowIndex}`,
-        '#{window_index}|#{window_id}|#{window_name}|#{pane_id}|#{pane_current_path}',
+        targetSelector,
+        '#{window_index}|#{window_id}|#{pane_id}',
       ],
       { encoding: 'utf8', stdio: 'pipe' },
     ).trim();
   } catch {
-    throw new PtyTargetError('window_not_found', `tmux window not found: ${session}:${windowIndex}`, {
+    throw new PtyTargetError('window_not_found', `tmux target not found: ${targetSelector}`, {
       requestedSession: session,
-      requestedWindowIndex: windowIndex,
+      requestedWindowIndex,
     });
   }
 
-  const [actualIndexRaw, windowId, windowName, paneId, ...cwdParts] = output.split('|');
+  const [actualIndexRaw, windowId, paneId] = identityOutput.split('|');
   const actualWindowIndex = Number(actualIndexRaw);
-  if (!Number.isInteger(actualWindowIndex) || actualWindowIndex !== windowIndex || !windowId) {
-    throw new PtyTargetError('window_identity_mismatch', `tmux resolved an unexpected window for ${session}:${windowIndex}`, {
+  if (
+    !Number.isSafeInteger(actualWindowIndex)
+    || (requestedWindowIndex !== null && actualWindowIndex !== requestedWindowIndex)
+    || !windowId
+    || !paneId
+  ) {
+    throw new PtyTargetError('window_identity_mismatch', `tmux resolved an unexpected window for ${targetSelector}`, {
       requestedSession: session,
-      requestedWindowIndex: windowIndex,
+      requestedWindowIndex,
       actualWindowIndex,
       windowId: windowId || null,
+      paneId: paneId || null,
     });
   }
+
+  let windowName = '';
+  let cwd = '';
+  try {
+    windowName = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{window_name}'], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+    }).trim();
+    cwd = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{pane_current_path}'], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+    }).trim();
+  } catch {
+    throw new PtyTargetError('window_not_found', `tmux target disappeared: ${targetSelector}`, {
+      requestedSession: session,
+      requestedWindowIndex,
+      windowId,
+      paneId,
+    });
+  }
+
   return {
     session,
     windowIndex: actualWindowIndex,
     windowId,
     windowName,
     paneId,
-    cwd: cwdParts.join('|'),
+    cwd,
   };
+}
+
+function resolveTmuxWindow(session, windowIndex) {
+  return resolveTmuxTarget(session, `${session}:${windowIndex}`, windowIndex);
+}
+
+function resolveTmuxCurrentTarget(session) {
+  return resolveTmuxTarget(session, session);
 }
 
 function killLinkedSession(linkedSession) {
@@ -2062,27 +2147,40 @@ function ensureWindowPty(session, windowIndex, connectionId) {
   }
   const key = ptyKey(session, windowIndex);
   const cached = ptyMap.get(key);
-  if (cached && cached.windowId === target.windowId) {
-    console.log(JSON.stringify({
-      event: 'nexus.pty.cache_hit',
-      connectionId,
-      requestedSession: session,
-      requestedWindowIndex: windowIndex,
-      actualSession: target.session,
-      actualWindowIndex: target.windowIndex,
-      windowId: target.windowId,
-      linkedSession: cached.linkedSession,
-      clients: cached.clients.size,
-    }));
-    return { key, entry: cached, target, cacheHit: true };
-  }
   if (cached) {
+    let linkedTarget = null;
+    try {
+      linkedTarget = resolveTmuxCurrentTarget(cached.linkedSession);
+    } catch { /* stale linked session is evicted below */ }
+    const cacheIdentityMatches = cached.windowId === target.windowId
+      && cached.paneId === target.paneId
+      && linkedTarget?.windowId === target.windowId
+      && linkedTarget?.paneId === target.paneId;
+    if (cacheIdentityMatches) {
+      console.log(JSON.stringify({
+        event: 'nexus.pty.cache_hit',
+        connectionId,
+        requestedSession: session,
+        requestedWindowIndex: windowIndex,
+        actualSession: target.session,
+        actualWindowIndex: target.windowIndex,
+        windowId: target.windowId,
+        paneId: target.paneId,
+        linkedSession: cached.linkedSession,
+        clients: cached.clients.size,
+      }));
+      return { key, entry: cached, target, cacheHit: true };
+    }
     console.warn(JSON.stringify({
       event: 'nexus.pty.stale_cache_evicted',
       connectionId,
       key,
       cachedWindowId: cached.windowId,
       actualWindowId: target.windowId,
+      cachedPaneId: cached.paneId,
+      actualPaneId: target.paneId,
+      linkedWindowId: linkedTarget?.windowId || null,
+      linkedPaneId: linkedTarget?.paneId || null,
     }));
     disposePtyEntry(key, cached);
   }
@@ -2091,9 +2189,36 @@ function ensureWindowPty(session, windowIndex, connectionId) {
   killLinkedSession(linkedSession);
   try {
     execFileSync('tmux', ['new-session', '-d', '-s', linkedSession, '-t', session], { stdio: 'pipe' });
-    execFileSync('tmux', ['select-window', '-t', `${linkedSession}:${windowIndex}`], { stdio: 'pipe' });
+    try {
+      execFileSync('tmux', ['select-window', '-t', `${linkedSession}:${target.windowId}`], { stdio: 'pipe' });
+    } catch {
+      throw new PtyTargetError('linked_window_identity_mismatch', `linked tmux target disappeared: ${target.windowId}`, {
+        requestedSession: session,
+        requestedWindowIndex: windowIndex,
+        windowId: target.windowId,
+      });
+    }
+    const linkedTarget = resolveTmuxCurrentTarget(linkedSession);
+    if (linkedTarget.windowId !== target.windowId || linkedTarget.paneId !== target.paneId) {
+      throw new PtyTargetError('linked_window_identity_mismatch', `linked tmux target mismatch: ${target.windowId}`, {
+        requestedSession: session,
+        requestedWindowIndex: windowIndex,
+        windowId: target.windowId,
+        actualWindowId: linkedTarget.windowId,
+        paneId: target.paneId,
+        actualPaneId: linkedTarget.paneId,
+      });
+    }
+    target = {
+      ...target,
+      windowIndex: linkedTarget.windowIndex,
+      windowName: linkedTarget.windowName,
+      paneId: linkedTarget.paneId,
+      cwd: linkedTarget.cwd,
+    };
   } catch (err) {
     killLinkedSession(linkedSession);
+    if (err instanceof PtyTargetError) throw err;
     throw new PtyTargetError('linked_session_failed', `failed to isolate tmux target ${session}:${windowIndex}`, {
       requestedSession: session,
       requestedWindowIndex: windowIndex,
@@ -2125,6 +2250,9 @@ function ensureWindowPty(session, windowIndex, connectionId) {
     clients: new Set(),
     clientSizes: new Map(),
     clientModes: new Map(),
+    initialActiveResizeClients: new Set(),
+    alternateScreen: false,
+    terminalModeScanTail: '',
     lastOutput: '',
     lastActivity: Date.now(),
     sourceSession: session,
@@ -2153,9 +2281,17 @@ function ensureWindowPty(session, windowIndex, connectionId) {
   ptyProc.onData((data) => {
     const ent = ptyMap.get(key);
     if (!ent) return;
-    ent.lastOutput = (ent.lastOutput + data).slice(-10000);
+    ent.lastOutput = appendAnsiOutput(ent.lastOutput, data, 10000);
+    const terminalMode = updateAlternateScreenState(
+      ent.alternateScreen,
+      ent.terminalModeScanTail,
+      data,
+    );
+    ent.alternateScreen = terminalMode.alternateScreen;
+    ent.terminalModeScanTail = terminalMode.scanTail;
     ent.lastActivity = Date.now();
     for (const ws of ent.clients) {
+      if (!shouldBroadcastPTYOutput(ws, ent.initialActiveResizeClients)) continue;
       if (ws.readyState === 1) {
         if (!ws.nexusFirstOutputLogged) {
           ws.nexusFirstOutputLogged = true;
@@ -2178,6 +2314,24 @@ function ensureWindowPty(session, windowIndex, connectionId) {
   });
 
   return { key, entry, target, cacheHit: false };
+}
+
+function authoritativeAlternateScreen(entry) {
+  try {
+    const value = execFileSync(
+      'tmux',
+      ['display-message', '-p', '-t', entry.paneId, '#{alternate_on}'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    return String(value).trim() === '1';
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'nexus.pty.alternate_query_failed',
+      paneId: entry.paneId,
+      errorType: error?.constructor?.name || 'Error',
+    }));
+    return entry.alternateScreen;
+  }
 }
 
 // WebSocket 服务 — 支持 /ws?token=xxx&window=<index>
@@ -2244,6 +2398,10 @@ wss.on('connection', (ws, req) => {
   ws.nexusFirstOutputLogged = false;
   entry.clients.add(ws);
   entry.clientModes.set(ws, resizeMode);
+  // Active clients intentionally do not receive old-size cache bytes. History
+  // owns content that has already scrolled away; the first valid resize below
+  // opens the gate and its resize nudge repaints the current visible pane.
+  if (resizeMode === RESIZE_MODE.ACTIVE) entry.initialActiveResizeClients.add(ws);
   console.log(JSON.stringify({
     event: 'nexus.ws.target_resolved',
     connectionId,
@@ -2260,17 +2418,19 @@ wss.on('connection', (ws, req) => {
     resizeMode,
   }));
 
-  // Send recent output so the screen isn't blank while waiting for the first repaint.
-  if (entry.lastOutput) {
+  // Passive observers may use a bounded cache; active clients must wait for the
+  // authoritative repaint triggered by their first valid resize.
+  if (resizeMode === RESIZE_MODE.PASSIVE && entry.lastOutput) {
+    const cachedOutput = safeAnsiSuffix(entry.lastOutput, 2000);
     ws.nexusFirstOutputLogged = true;
     console.log(JSON.stringify({
       event: 'nexus.ws.first_output',
       connectionId,
       actualKey: key,
-      byteLength: Buffer.byteLength(entry.lastOutput.slice(-2000), 'utf8'),
+      byteLength: Buffer.byteLength(cachedOutput, 'utf8'),
       source: 'cache',
     }));
-    ws.send(entry.lastOutput.slice(-2000));
+    ws.send(cachedOutput);
   }
 
   ws.on('message', (msg) => {
@@ -2280,17 +2440,38 @@ wss.on('connection', (ws, req) => {
     let isResize = false;
     try {
       const data = JSON.parse(str);
-      if (data && data.type === 'resize' && data.cols && data.rows) {
+      if (data && data.type === 'resize') {
         isResize = true;
-        const newCols = Number(data.cols);
-        const newRows = Number(data.rows);
-        ent.clientSizes.set(ws, { cols: newCols, rows: newRows });
-        // Phase 2 resize isolation: passive clients record their size but must
-        // NOT call pty.resize — they are observers of the shared PTY/tmux pane
-        // and must not break the active (PC) client's viewport.
-        const mode = ent.clientModes.get(ws);
-        if (shouldResizePTY(mode)) {
-          ent.pty.resize(Math.max(newCols, 10), Math.max(newRows, 5));
+        const normalizedSize = normalizeResizeSize(data.cols, data.rows);
+        if (normalizedSize) {
+          ent.clientSizes.set(ws, normalizedSize);
+          // Phase 2 resize isolation: passive clients record their size but must
+          // NOT call pty.resize — they are observers of the shared PTY/tmux pane
+          // and must not break the active (PC) client's viewport.
+          const mode = ent.clientModes.get(ws);
+          if (shouldResizePTY(mode)) {
+            const resizeSteps = resizePlan(
+              mode,
+              normalizedSize.cols,
+              normalizedSize.rows,
+              ent.initialActiveResizeClients.has(ws),
+            );
+            if (resizeSteps.length > 0) {
+              const isInitialActiveResize = ent.initialActiveResizeClients.has(ws);
+              ent.initialActiveResizeClients.delete(ws);
+              if (isInitialActiveResize && ws.readyState === 1) {
+                ent.alternateScreen = authoritativeAlternateScreen(ent);
+                console.log(JSON.stringify({
+                  event: 'nexus.ws.initial_mode_sync',
+                  connectionId,
+                  actualKey: key,
+                  alternateScreen: ent.alternateScreen,
+                }));
+                ws.send(terminalModeSync(ent.alternateScreen));
+              }
+              for (const size of resizeSteps) ent.pty.resize(size.cols, size.rows);
+            }
+          }
         }
       }
     } catch { /* not JSON — fall through to pty.write */ }
@@ -2317,6 +2498,7 @@ wss.on('connection', (ws, req) => {
       ent.clients.delete(ws);
       ent.clientSizes.delete(ws);
       ent.clientModes.delete(ws);
+      ent.initialActiveResizeClients.delete(ws);
       console.log(JSON.stringify({
         event: 'nexus.ws.disconnected',
         connectionId,
@@ -2350,7 +2532,12 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => {
     console.error('WebSocket error:', err.message);
     const ent = ptyMap.get(key);
-    if (ent) { ent.clients.delete(ws); ent.clientSizes.delete(ws); ent.clientModes.delete(ws); }
+    if (ent) {
+      ent.clients.delete(ws);
+      ent.clientSizes.delete(ws);
+      ent.clientModes.delete(ws);
+      ent.initialActiveResizeClients.delete(ws);
+    }
   });
 });
 

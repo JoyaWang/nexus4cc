@@ -49,3 +49,21 @@ ttyd -t fontSize=14 -t fontFamily="Sarasa Mono SC" claude
 ```
 
 **如果没法换字体**，还有一个思路是在 tmux 里设置 `set -g utf8 on` 以及确认 locale 是 `zh_CN.UTF-8`，不过这通常只影响是否能显示中文，不解决宽度问题。
+
+---
+
+## 服务端 scrollback 修复记录
+
+根因不只是字体：旧服务端在 WebSocket 新连接时直接发送 `entry.lastOutput.slice(-2000)`，可能从 ANSI 控制序列中间截断；scrollback 路由还用 shell 字符串执行 `capture-pane`，并对每行调用 `trimEnd()`，会丢失终端布局所需的尾随空格。一次性返回完整 content 也无法在稳定内容上做分页。
+
+当前协议：
+
+- 兼容请求 `GET /api/sessions/:id/scrollback?session=X&lines=N` 仍返回 `{ content: string }`。
+- 不带 `limit`、`offset`、`snapshot` 的请求保持 legacy 默认行为，按 3000 行捕获；显式提供这些分页参数后才进入分页协议。
+- 分页首请求使用 `?session=X&limit=400&offset=0`，服务端在内存中创建稳定 snapshot。
+- 后续请求使用 `?session=X&limit=400&offset=<next>&snapshot=<snapshotId>`；offset 从最老逻辑行向更新逻辑行递增。
+- 分页响应包含 `content`、`format: "ansi"`、`ansiPreserved: true`、`windowId`、`snapshotId`、`offset`、`returnedLines`、`totalLines`、`hasMore`、`nextOffset`。这里的 `ansiPreserved` 仅表示原始 ANSI 字节在服务端捕获和逻辑行切分过程中保留，不表示每页都能独立解析出完整 terminal state；分页边界仍是逻辑行边界，不是完整 ANSI 状态边界。
+- snapshot identity 包含 session、window index、tmux windowId 和稳定 paneId。首次请求与 continuation 都会重新解析真实 target；同一 index 被复用时，旧 snapshot 返回 HTTP 409。目标不存在返回 HTTP 404，其他 capture 异常返回 HTTP 500。
+- `capture-pane` 使用 `execFile` 参数数组、稳定 paneId target 并保留 `-e`；分页请求从 tmux history 起点 `-S -` 捕获，显式 `lines=N` 请求使用 `-S -N`；原始行尾空格不在服务端清除。
+- 分页 limit 上限与 legacy capture 上限分离（当前分别为 1000 与 10000）；snapshot 默认 TTL 为 10 分钟，成功读取会刷新访问时间，容量上限为 12 个，并有总字节预算。TTL 清理在 snapshot 访问或创建时执行。
+- `resizeMode=active` 新连接不发送旧尺寸 output cache，这是产品选择；已经滚出当前 live screen 的内容由 History 提供。该连接第一次有效 resize 后解除 output gate，并依靠 resize nudge 产生当前可见 pane 的 authoritative repaint；此 repaint 依赖客户端确实发送首次有效 resize，后续 resize 仍为单次调用。passive cache 若发送则经过 ANSI control-token-safe suffix 函数。

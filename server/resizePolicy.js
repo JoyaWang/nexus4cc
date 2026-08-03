@@ -25,6 +25,9 @@ export const RESIZE_MODE = Object.freeze({
   PASSIVE: 'passive',
 });
 
+export const MIN_PTY_COLS = 10;
+export const MIN_PTY_ROWS = 5;
+
 // Parse the `resizeMode` query param. Unknown/missing → ACTIVE (back-compat).
 // @param {string|null|undefined} param
 // @returns {'active'|'passive'}
@@ -40,6 +43,41 @@ export function parseResizeMode(param) {
 // @returns {boolean}
 export function shouldResizePTY(mode) {
   return mode !== RESIZE_MODE.PASSIVE;
+}
+
+export function shouldBroadcastPTYOutput(client, initialActiveResizeClients) {
+  return !initialActiveResizeClients?.has(client);
+}
+
+function parseResizeDimension(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string' || !/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function normalizeResizeSize(cols, rows) {
+  const normalizedCols = parseResizeDimension(cols);
+  const normalizedRows = parseResizeDimension(rows);
+  if (!Number.isFinite(normalizedCols) || !Number.isFinite(normalizedRows) || normalizedCols <= 0 || normalizedRows <= 0) {
+    return null;
+  }
+  return {
+    cols: Math.max(Math.floor(normalizedCols), MIN_PTY_COLS),
+    rows: Math.max(Math.floor(normalizedRows), MIN_PTY_ROWS),
+  };
+}
+
+export function resizePlan(mode, cols, rows, initialActiveResize) {
+  const size = normalizeResizeSize(cols, rows);
+  if (!size || !shouldResizePTY(mode)) return [];
+  if (!initialActiveResize) return [size];
+  return [
+    { ...size, rows: Math.max(size.rows - 1, MIN_PTY_ROWS) },
+    size,
+  ];
 }
 
 // Filter clientSizes down to ACTIVE clients only, for use in min-size

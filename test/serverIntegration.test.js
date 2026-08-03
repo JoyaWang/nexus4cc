@@ -28,6 +28,7 @@ test('server.js imports all four policy functions', () => {
   assert.match(serverSrc, /\bshouldResizePTY\b/);
   assert.match(serverSrc, /\bactiveClientSizes\b/);
   assert.match(serverSrc, /\bcomputeMinSize\b/);
+  assert.match(serverSrc, /\bnormalizeResizeSize\b/);
 });
 
 test('server.js parses resizeMode from the WS URL query string', () => {
@@ -46,6 +47,17 @@ test('server.js records per-client resize mode (clientModes map)', () => {
 test('server.js gates pty.resize on shouldResizePTY in the resize message branch', () => {
   // The resize branch must call shouldResizePTY(mode) before pty.resize().
   assert.match(serverSrc, /if \(shouldResizePTY\(mode\)\)\s*\{[\s\S]*?ent\.pty\.resize/);
+});
+
+test('server.js normalizes resize input before recording client size', () => {
+  const resizeBranchMatch = serverSrc.match(
+    /data\.type === ['"]resize['"][\s\S]*?}\s*}\s*catch/
+  );
+  assert.ok(resizeBranchMatch, 'resize branch must exist');
+  const branch = resizeBranchMatch[0];
+  assert.match(branch, /normalizeResizeSize\(data\.cols,\s*data\.rows\)/);
+  assert.match(branch, /if \(normalizedSize\)/);
+  assert.match(branch, /ent\.clientSizes\.set\(ws,\s*normalizedSize\)/);
 });
 
 test('server.js recomputes min size using active clients only on disconnect', () => {
@@ -96,17 +108,94 @@ test('server.js no longer uses jwt.sign directly', () => {
   assert.ok(!serverSrc.match(/jwt\.sign/), 'server.js must not use jwt.sign directly');
 });
 
+// ---- terminal output and scrollback contract guards ----
+
+test('server.js wires ANSI-safe terminal output and scrollback modules', () => {
+  assert.match(serverSrc, /from ['"]\.\/server\/terminalOutput\.js['"]/);
+  assert.match(serverSrc, /from ['"]\.\/server\/scrollback\.js['"]/);
+  assert.match(serverSrc, /safeAnsiSuffix/);
+  assert.match(serverSrc, /capturePane/);
+});
+
+test('active WebSocket clients do not receive the lastOutput cache on connect', () => {
+  const connectionBlock = serverSrc.match(/entry\.clientModes\.set\(ws, resizeMode\)[\s\S]*?ws\.on\('message'/);
+  assert.ok(connectionBlock, 'WebSocket connection setup must exist');
+  assert.match(connectionBlock[0], /RESIZE_MODE\.PASSIVE/);
+  assert.match(connectionBlock[0], /safeAnsiSuffix\(entry\.lastOutput/);
+  assert.doesNotMatch(serverSrc, /ws\.send\(entry\.lastOutput\.slice\(-2000\)\)/);
+});
+
+test('scrollback route uses the extracted capture helper and paginated snapshot metadata', () => {
+  assert.match(serverSrc, /new ScrollbackStore/);
+  assert.match(serverSrc, /snapshotId/);
+  assert.match(serverSrc, /returnedLines/);
+  assert.match(serverSrc, /totalLines/);
+  assert.match(serverSrc, /hasMore/);
+  assert.match(serverSrc, /nextOffset/);
+});
+
+test('first valid active resize uses a two-step resize plan', () => {
+  assert.match(serverSrc, /resizePlan\([\s\S]*normalizedSize\.cols[\s\S]*normalizedSize\.rows[\s\S]*ent\.initialActiveResizeClients\.has\(ws\)/);
+  assert.match(serverSrc, /ent\.initialActiveResizeClients\.delete\(ws\)/);
+  assert.match(serverSrc, /for \(const size of resizeSteps\)/);
+});
+
+test('pty output is suppressed for active clients until their first resize is accepted', () => {
+  const onDataBlock = serverSrc.match(/ptyProc\.onData\(\(data\) => \{[\s\S]*?\n  \}\);/);
+  assert.ok(onDataBlock, 'pty onData handler must exist');
+  assert.match(onDataBlock[0], /shouldBroadcastPTYOutput\(ws, ent\.initialActiveResizeClients\)/);
+  assert.match(onDataBlock[0], /if \(!shouldBroadcastPTYOutput[\s\S]*?continue/);
+  assert.match(serverSrc, /ent\.initialActiveResizeClients\.delete\(ws\);[\s\S]*?for \(const size of resizeSteps\)/);
+});
+
+test('first active resize syncs tracked alternate-screen state before repaint', () => {
+  assert.match(serverSrc, /updateAlternateScreenState\(/);
+  assert.match(serverSrc, /authoritativeAlternateScreen\(ent\)/);
+  assert.match(serverSrc, /ws\.send\(terminalModeSync\(ent\.alternateScreen\)\)/);
+});
+
+test('scrollback route delegates strict request validation and separates full-history capture from legacy lines', () => {
+  assert.match(serverSrc, /parseScrollbackParams/);
+  assert.match(serverSrc, /start: isLegacy \? `-\$\{legacyLines\}` : '-'/);
+  assert.match(serverSrc, /MAX_PAGE_LIMIT/);
+  assert.match(serverSrc, /MAX_LEGACY_CAPTURE_LINES/);
+});
+
+test('scrollback route resolves stable target identity before snapshot lookup and capture', () => {
+  assert.match(serverSrc, /(?:let|const) resolvedTarget[\s\S]*?resolveTmuxWindow\(session, windowIndex\)/);
+  assert.match(serverSrc, /scrollbackStore\.get\(snapshotId, resolvedTarget\)/);
+  assert.match(serverSrc, /capturePane\(\{[\s\S]*target: resolvedTarget/);
+  assert.match(serverSrc, /capturePane\(\{[\s\S]*target: resolvedTarget[\s\S]*start:/);
+  assert.equal(
+    (serverSrc.match(/sameTmuxTargetIdentity\(currentTarget,\s*resolvedTarget\)/g) || []).length,
+    2,
+    'capture completion and capture error paths must compare full target identity',
+  );
+});
+
+test('scrollback route maps missing targets to 404 and identity mismatches to 409', () => {
+  assert.match(serverSrc, /scrollbackErrorStatus/);
+  assert.match(serverSrc, /error\.code === ['"]session_not_found['"][\s\S]*?return 404/);
+  assert.match(serverSrc, /error\.code === ['"]window_identity_mismatch['"][\s\S]*?return 409/);
+});
+
 // ---- strict per-window PTY target guards ----
 
 test('server.js attaches PTYs through per-window linked tmux sessions', () => {
   assert.match(serverSrc, /linkedSessionName\(session,\s*target\.windowId\)/);
   assert.match(serverSrc, /new-session['"],\s*['"]-d['"],\s*['"]-s['"],\s*linkedSession,\s*['"]-t['"],\s*session/);
-  assert.match(serverSrc, /select-window['"],\s*['"]-t['"],\s*`\$\{linkedSession\}:\$\{windowIndex\}`/);
+  assert.match(serverSrc, /select-window['"],\s*['"]-t['"],\s*`\$\{linkedSession\}:\$\{target\.windowId\}`/);
   assert.match(serverSrc, /attach-session['"],\s*['"]-t['"],\s*linkedSession/);
+  assert.match(serverSrc, /resolveTmuxCurrentTarget\(linkedSession\)/);
+  assert.match(serverSrc, /linkedTarget\.windowId !== target\.windowId/);
+  assert.match(serverSrc, /linkedTarget\.paneId !== target\.paneId/);
+  assert.match(serverSrc, /windowName: linkedTarget\.windowName/);
+  assert.match(serverSrc, /cwd: linkedTarget\.cwd/);
+  assert.match(serverSrc, /linked_window_identity_mismatch/);
 });
 
 test('server.js rejects missing targets instead of falling back to default or first window', () => {
-  const targetBlock = serverSrc.match(/function resolveTmuxWindow[\s\S]*?function ensureWindowPty[\s\S]*?\n}\n\n\/\/ WebSocket/);
+  const targetBlock = serverSrc.match(/function resolveTmuxTarget[\s\S]*?function ensureWindowPty[\s\S]*?\n}\n\n\/\/ WebSocket/);
   assert.ok(targetBlock, 'target resolution and ensureWindowPty blocks must exist');
   assert.doesNotMatch(targetBlock[0], /safeSession\s*=\s*TMUX_SESSION/);
   assert.doesNotMatch(targetBlock[0], /targetWindow\s*=\s*parseInt\(windows\[0\]/);
@@ -157,4 +246,17 @@ test('delete window disposes the matching PTY entry and linked session', () => {
 test('ensureWindowPty evicts stale PTY when the target window is dead', () => {
   assert.match(serverSrc, /nexus\.pty\.dead_window_evicted/);
   assert.match(serverSrc, /disposePtyEntry\(ptyKey\(session, windowIndex\), stale\)/);
+});
+
+test('ensureWindowPty revalidates cached linked current window and pane identity', () => {
+  const ensureBlock = serverSrc.match(
+    /function ensureWindowPty[\s\S]*?\n}\n\nfunction authoritativeAlternateScreen/,
+  );
+  assert.ok(ensureBlock, 'ensureWindowPty block must exist');
+  assert.match(ensureBlock[0], /resolveTmuxCurrentTarget\(cached\.linkedSession\)/);
+  assert.match(ensureBlock[0], /cached\.windowId === target\.windowId/);
+  assert.match(ensureBlock[0], /cached\.paneId === target\.paneId/);
+  assert.match(ensureBlock[0], /linkedTarget\?\.windowId === target\.windowId/);
+  assert.match(ensureBlock[0], /linkedTarget\?\.paneId === target\.paneId/);
+  assert.match(ensureBlock[0], /disposePtyEntry\(key, cached\)/);
 });

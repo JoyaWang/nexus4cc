@@ -17,6 +17,9 @@ import {
   shouldResizePTY,
   activeClientSizes,
   computeMinSize,
+  normalizeResizeSize,
+  resizePlan,
+  shouldBroadcastPTYOutput,
 } from '../server/resizePolicy.js';
 
 // ---------- parseResizeMode ----------
@@ -52,6 +55,58 @@ test('shouldResizePTY: ACTIVE client may resize PTY', () => {
 
 test('shouldResizePTY: PASSIVE client must NOT resize PTY', () => {
   assert.equal(shouldResizePTY(RESIZE_MODE.PASSIVE), false);
+});
+
+test('normalizeResizeSize: rejects invalid sizes and clamps terminal minimums', () => {
+  assert.equal(normalizeResizeSize('bad', 30), null);
+  assert.equal(normalizeResizeSize(100, 'bad'), null);
+  assert.equal(normalizeResizeSize(-1, 30), null);
+  assert.equal(normalizeResizeSize(true, true), null);
+  assert.equal(normalizeResizeSize([80], [24]), null);
+  assert.equal(normalizeResizeSize({ cols: 80 }, 24), null);
+  assert.equal(normalizeResizeSize('', ' '), null);
+  assert.equal(normalizeResizeSize('0x50', '24'), null);
+  assert.deepEqual(normalizeResizeSize('80', '24'), { cols: 80, rows: 24 });
+  assert.deepEqual(normalizeResizeSize(1, 2), { cols: 10, rows: 5 });
+});
+
+test('resize gate remains closed for invalid input and opens only for a valid normalized size', () => {
+  const pending = { id: 'active' };
+  const pendingClients = new Set([pending]);
+
+  assert.equal(normalizeResizeSize('bad', 30), null);
+  assert.equal(shouldBroadcastPTYOutput(pending, pendingClients), false);
+  assert.deepEqual(resizePlan(RESIZE_MODE.ACTIVE, 80, 24, true), [
+    { cols: 80, rows: 23 },
+    { cols: 80, rows: 24 },
+  ]);
+  pendingClients.delete(pending);
+  assert.equal(shouldBroadcastPTYOutput(pending, pendingClients), true);
+});
+
+test('resizePlan: first active resize nudges rows then repaints at the target size', () => {
+  assert.deepEqual(resizePlan(RESIZE_MODE.ACTIVE, 120, 40, true), [
+    { cols: 120, rows: 39 },
+    { cols: 120, rows: 40 },
+  ]);
+  assert.deepEqual(resizePlan(RESIZE_MODE.ACTIVE, 8, 5, true), [
+    { cols: 10, rows: 5 },
+    { cols: 10, rows: 5 },
+  ]);
+});
+
+test('resizePlan: subsequent active resize is one operation and passive is none', () => {
+  assert.deepEqual(resizePlan(RESIZE_MODE.ACTIVE, 120, 40, false), [{ cols: 120, rows: 40 }]);
+  assert.deepEqual(resizePlan(RESIZE_MODE.PASSIVE, 120, 40, true), []);
+});
+
+test('shouldBroadcastPTYOutput: pending active clients are suppressed until resize is accepted', () => {
+  const active = { id: 'active' };
+  const pending = new Set([active]);
+
+  assert.equal(shouldBroadcastPTYOutput(active, pending), false);
+  pending.delete(active);
+  assert.equal(shouldBroadcastPTYOutput(active, pending), true);
 });
 
 // ---------- activeClientSizes ----------
