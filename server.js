@@ -36,6 +36,7 @@ import {
   splitLogicalLines,
   stripCurrentPane,
 } from './server/scrollback.js';
+import { readOpenCodeHistory, readLatestOpenCodeHistory } from './server/opencodeHistory.js';
 import {
   isNexusLinkedSession,
   linkedSessionName,
@@ -1064,7 +1065,7 @@ app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
     start: isLegacy ? `-${legacyLines}` : '-',
     execFileFn: execFile,
   })
-    .then(({ content, paneHeight }) => {
+    .then(({ content, paneHeight, alternateOn }) => {
       let currentTarget;
       try {
         currentTarget = resolveTmuxWindow(session, windowIndex);
@@ -1074,7 +1075,11 @@ app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
       if (!sameTmuxTargetIdentity(currentTarget, resolvedTarget)) {
         return res.status(409).json({ error: 'scrollback_target_changed' });
       }
-      const lines = stripCurrentPane(splitLogicalLines(content), paneHeight);
+      // 普通 shell 的 capture 末尾包含与 live 画面重复的一整屏，剥掉避免内容重复；
+      // alternate-screen TUI（OpenCode/vim/less）的权威状态就在当前屏幕，剥掉会清空真实历史。
+      const lines = alternateOn
+        ? splitLogicalLines(content)
+        : stripCurrentPane(splitLogicalLines(content), paneHeight);
       if (isLegacy) return res.json({ content: lines.join('\n') });
       const created = scrollbackStore.create(resolvedTarget, lines);
       return sendPage({ snapshotId: created.snapshotId, target: resolvedTarget, lines }, 0, requestedLimit);
@@ -1090,6 +1095,63 @@ app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
       return res.status(status).json({ error: error.code || error.message || 'scrollback_capture_failed' });
     });
 })
+
+// GET /api/sessions/:id/opencode-history — 一次性返回 OpenCode 对话全量历史
+// 用于 alternate-screen TUI：tmux scrollback 只有 1 行，完整对话在 OpenCode SQLite。
+// App 端预加载到内存缓存，下拉 History 直接渲染（零 loading、丝滑滚动）。
+app.get('/api/sessions/:id/opencode-history', authMiddleware, (req, res) => {
+  const session = req.query.session || TMUX_SESSION;
+  const parsedWindow = parseWindowIndex(req.params.id);
+  if (!parsedWindow.ok) return res.status(400).json({ error: 'invalid window index' });
+
+  let resolvedTarget;
+  try {
+    resolvedTarget = resolveTmuxWindow(session, parsedWindow.value);
+  } catch (error) {
+    return res.status(scrollbackErrorStatus(error)).json({ error: error.code || 'target_failed' });
+  }
+
+  // 从 pane metadata 提取 OpenCode 会话标识
+  // OpenCode 把对话标题设为 pane title（alternate-screen TUI），
+  // tmux window name 是人工起的名字，不能用来匹配会话。
+  const directory = resolvedTarget.cwd;
+  const paneTitle = resolvedTarget.paneTitle || '';
+  const windowName = resolvedTarget.windowName || '';
+  if (!directory || (!paneTitle && !windowName)) {
+    return res.status(400).json({ error: 'pane metadata missing directory or title' });
+  }
+
+  // paneTitle 剥离常见模式前缀（如 "OC | "、"claude | "、"codex | "）后匹配；
+  // 依次尝试：paneTitle 原样 → 剥离前缀 → windowName → directory 最新会话。
+  const strippedPaneTitle = paneTitle.replace(/^(OC|claude|codex|gemini|ai)\s*\|\s*/i, '');
+  const titleCandidates = [
+    paneTitle,
+    strippedPaneTitle,
+    windowName,
+  ].filter((value, index, self) => value && self.indexOf(value) === index);
+
+  try {
+    let result = { ok: false, error: 'session_not_found', lines: [] };
+    for (const candidate of titleCandidates) {
+      if (!candidate) continue;
+      result = readOpenCodeHistory({ directory, title: candidate });
+      if (result.ok) break;
+    }
+    if (!result.ok) {
+      result = readLatestOpenCodeHistory({ directory });
+    }
+    if (!result.ok) {
+      return res.status(404).json({ error: result.error });
+    }
+    res.json({
+      lines: result.lines,
+      totalLines: result.lines.length,
+      sessionId: result.sessionId,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'opencode_history_failed' });
+  }
+});
 
 // GET /api/config — 服务端配置信息（供前端初始化用）
 app.get('/api/config', authMiddleware, (req, res) => {
@@ -2060,9 +2122,14 @@ function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null)
   }
 
   let windowName = '';
+  let paneTitle = '';
   let cwd = '';
   try {
     windowName = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{window_name}'], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+    }).trim();
+    paneTitle = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{pane_title}'], {
       encoding: 'utf8',
       stdio: 'pipe',
     }).trim();
@@ -2084,6 +2151,7 @@ function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null)
     windowIndex: actualWindowIndex,
     windowId,
     windowName,
+    paneTitle,
     paneId,
     cwd,
   };

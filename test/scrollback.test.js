@@ -168,7 +168,7 @@ test('capturePane uses the stable pane identity, keeps -e, and does not trim pan
   const calls = [];
   const execFileFn = (command, args, options, callback) => {
     calls.push({ command, args, options });
-    if (args[0] === 'display') return callback(null, '24|2000\n', '');
+    if (args[0] === 'display') return callback(null, '24|2000|0\n', '');
     callback(null, '\x1b[31mred  \n', '');
   };
 
@@ -183,6 +183,7 @@ test('capturePane uses the stable pane identity, keeps -e, and does not trim pan
     'capture-pane', '-e', '-p', '-S', '-3000', '-t', '%4',
   ]);
   assert.equal(result.paneHeight, 24);
+  assert.equal(result.alternateOn, false);
   assert.equal(result.content, '\x1b[31mred  \n');
 });
 
@@ -190,7 +191,7 @@ test('capturePane expands the history-start marker to the pane history limit', a
   const calls = [];
   const execFileFn = (command, args, options, callback) => {
     calls.push(args);
-    if (args[0] === 'display') return callback(null, '24|2000\n', '');
+    if (args[0] === 'display') return callback(null, '24|2000|0\n', '');
     callback(null, 'old\nnew', '');
   };
 
@@ -207,7 +208,7 @@ test('capturePane uses the history limit when no start or lines are given', asyn
   const calls = [];
   const execFileFn = (command, args, options, callback) => {
     calls.push(args);
-    if (args[0] === 'display') return callback(null, '30|5000\n', '');
+    if (args[0] === 'display') return callback(null, '30|5000|0\n', '');
     callback(null, 'x\n', '');
   };
 
@@ -217,6 +218,28 @@ test('capturePane uses the history limit when no start or lines are given', asyn
   });
 
   assert.deepEqual(calls[1], ['capture-pane', '-e', '-p', '-S', '-5000', '-t', '%4']);
+});
+
+test('capturePane reports alternate-screen mode for TUI panes', async () => {
+  const calls = [];
+  const execFileFn = (command, args, options, callback) => {
+    calls.push(args);
+    if (args[0] === 'display') return callback(null, '57|10000|1\n', '');
+    callback(null, 'OpenCode current frame\n', '');
+  };
+
+  const result = await capturePane({
+    target: { session: 'safe-session', windowIndex: 5, windowId: '@313', paneId: '%337' },
+    start: '-',
+    execFileFn,
+  });
+
+  assert.deepEqual(calls[0], [
+    'display', '-p', '-t', '%337', '#{pane_height}|#{history_limit}|#{alternate_on}',
+  ]);
+  assert.deepEqual(calls[1], ['capture-pane', '-e', '-p', '-S', '-10000', '-t', '%337']);
+  assert.equal(result.paneHeight, 57);
+  assert.equal(result.alternateOn, true);
 });
 
 test('capturePane rejects when the pane display query fails', async () => {

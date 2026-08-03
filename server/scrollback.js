@@ -183,10 +183,11 @@ export function capturePane({ target, lines, start, execFileFn = defaultExecFile
   const captureStart = start ?? (lines === undefined ? FULL_HISTORY_CAPTURE_START : `-${lines}`);
   const options = { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 };
   return new Promise((resolve, reject) => {
-    execFileFn('tmux', ['display', '-p', '-t', paneTarget, '#{pane_height}|#{history_limit}'], options, (displayError, displayOutput) => {
-      const [heightRaw, historyLimitRaw] = String(displayOutput ?? '').trim().split('|');
+    execFileFn('tmux', ['display', '-p', '-t', paneTarget, '#{pane_height}|#{history_limit}|#{alternate_on}'], options, (displayError, displayOutput) => {
+      const [heightRaw, historyLimitRaw, alternateRaw] = String(displayOutput ?? '').trim().split('|');
       const paneHeight = Number.parseInt(heightRaw, 10) || 50;
       const historyLimit = Number.parseInt(historyLimitRaw, 10) || 0;
+      const alternateOn = alternateRaw === '1';
       if (displayError) return reject(displayError);
       // tmux 3.5a 会把 `capture-pane -S -` 解析成 `-S -0`（只捕获当前屏幕，不含 scrollback），
       // 所以“全部历史”必须显式展开为 `-S -<history_limit>`；超出历史起点时 tmux 会自动从起点截断，无副作用。
@@ -195,7 +196,7 @@ export function capturePane({ target, lines, start, execFileFn = defaultExecFile
         : captureStart;
       execFileFn('tmux', ['capture-pane', '-e', '-p', '-S', effectiveStart, '-t', paneTarget], options, (captureError, output) => {
         if (captureError) return reject(captureError);
-        resolve({ content: String(output ?? ''), paneHeight });
+        resolve({ content: String(output ?? ''), paneHeight, alternateOn });
       });
     });
   });
