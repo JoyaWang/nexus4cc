@@ -6,6 +6,8 @@
 // - Never notify for plain shell prompt returns.
 // - Suppress classification flicker and enforce per-kind cooldowns.
 
+import { createHash } from 'node:crypto';
+
 export const LINKED_SESSION_PREFIX = '__nexus_ws_';
 
 /**

@@ -4,6 +4,8 @@ import {
   TmuxPushStateMachine,
   classifyTmuxPane,
   parseTmuxWindowList,
+  tmuxActivityDigest,
+  tmuxPushDirectory,
   tmuxPushTargetKey,
 } from '../server/tmuxPushWatcher.js';
 
@@ -175,6 +177,19 @@ test('idle_silent disarms without notifying', () => {
   assert.equal(sm.update(KEY, 'idle_silent', digestOf('s2'), now += 2000), null);
   assert.equal(sm.update(KEY, 'session.idle', digestOf('i1'), now += 2000), null);
   assert.equal(sm.update(KEY, 'session.idle', digestOf('i2'), now += 2000), null);
+});
+
+test('digest and directory helpers are stable and import-safe', () => {
+  // Regression: tmuxActivityDigest previously referenced an unimported
+  // createHash, which crashed the watcher loop in the running service while
+  // the test suite stayed green.
+  assert.equal(tmuxActivityDigest('abc'), tmuxActivityDigest('abc'));
+  assert.notEqual(tmuxActivityDigest('abc'), tmuxActivityDigest('abd'));
+  assert.match(tmuxActivityDigest('abc'), /^[0-9a-f]{64}$/);
+  assert.equal(
+    tmuxPushDirectory('conn-1', TARGET),
+    'tmux://conn-1/28/@39/%41',
+  );
 });
 
 test('prune drops state for windows that disappeared', () => {

@@ -3182,8 +3182,9 @@ async function pollTmuxPushTargets() {
           console.warn(JSON.stringify({ event: 'nexus.tmux_push.forward_failed', errorType: error?.constructor?.name || 'Error' }));
         });
       }
-    } catch {
+    } catch (captureError) {
       // Pane/window removal is normal; discovery on the next tick drops it.
+      console.warn(JSON.stringify({ event: 'nexus.tmux_push.capture_failed', windowId: target.windowId, errorType: captureError?.constructor?.name || 'Error', message: String(captureError?.message || captureError).slice(0, 120) }));
     }
   }
   tmuxPushStateMachine.prune(liveKeys);
