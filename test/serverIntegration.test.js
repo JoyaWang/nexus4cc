@@ -260,3 +260,48 @@ test('ensureWindowPty revalidates cached linked current window and pane identity
   assert.match(ensureBlock[0], /linkedTarget\?\.paneId === target\.paneId/);
   assert.match(ensureBlock[0], /disposePtyEntry\(key, cached\)/);
 });
+
+test('server.js imports and wires the paneLayout push module', () => {
+  assert.match(serverSrc, /from ['"]\.\/server\/paneLayout\.js['"]/);
+  assert.match(serverSrc, /\bpaneLayoutMessage\b/);
+  assert.match(serverSrc, /\bqueryPaneLayout\b/);
+  assert.match(serverSrc, /\bsamePaneLayout\b/);
+});
+
+test('server.js pushes pane layout after the identity handshake', () => {
+  const handshake = serverSrc.match(
+    /type: 'hello'[\s\S]*?entry\.initialActiveResizeClients\.add\(ws\)/,
+  );
+  assert.ok(handshake, 'hello handshake block must exist');
+  assert.match(handshake[0], /pushPaneLayoutTo\(ws, entry\)/);
+});
+
+test('server.js pushes pane layout after a client resize takes effect', () => {
+  const resizeIdx = serverSrc.indexOf(
+    'for (const size of resizeSteps) ent.pty.resize(size.cols, size.rows);',
+  );
+  assert.ok(resizeIdx >= 0, 'pty.resize call must exist');
+  const afterResize = serverSrc.slice(resizeIdx, resizeIdx + 500);
+  assert.match(afterResize, /pushPaneLayoutTo\(ws, ent\)/);
+  assert.match(afterResize, /schedulePaneLayoutPoll\(ent\)/);
+});
+
+test('server.js debounced layout poll is driven by PTY output activity', () => {
+  const onDataBlock = serverSrc.match(
+    /ptyProc\.onData\(\(data\) => \{[\s\S]*?for \(const ws of ent\.clients\)/,
+  );
+  assert.ok(onDataBlock, 'ptyProc.onData block must exist');
+  assert.match(onDataBlock[0], /schedulePaneLayoutPoll\(ent\)/);
+  // The debounce constant lives with the helper definition, not inside the
+  // onData callback; verify it exists once in the file.
+  assert.match(serverSrc, /PANE_LAYOUT_POLL_DEBOUNCE_MS = 350/);
+});
+
+test('server.js clears the layout poll timer when disposing a PTY entry', () => {
+  const disposeBlock = serverSrc.match(
+    /function disposePtyEntry\(key, entry\) \{[\s\S]*?\n\}/,
+  );
+  assert.ok(disposeBlock, 'disposePtyEntry block must exist');
+  assert.match(disposeBlock[0], /entry\?\.layoutPollTimer/);
+  assert.match(disposeBlock[0], /clearTimeout\(entry\.layoutPollTimer\)/);
+});

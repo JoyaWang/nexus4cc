@@ -6,10 +6,12 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "setup": "node scripts/setup.js",
-    "test": "node --test test/auth.test.js test/frontend-auth.test.js test/resizePolicy.test.js test/ptyTarget.test.js test/serverIntegration.test.js test/terminalOutput.test.js test/scrollback.test.js"
+    "test": "node --test test/auth.test.js test/frontend-auth.test.js test/resizePolicy.test.js test/ptyTarget.test.js test/serverIntegration.test.js test/terminalOutput.test.js test/scrollback.test.js test/authoritativeHistory.test.js test/tmuxPushWatcher.test.js"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",

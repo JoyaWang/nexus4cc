@@ -3,12 +3,14 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import * as pty from 'node-pty';
 import { createServer } from 'node:http';
+import { hostname } from 'node:os';
 import { exec, spawn, execSync, execFile, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join, normalize, isAbsolute, basename } from 'path';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, statSync, rmdirSync, renameSync, cpSync, rmSync } from 'fs';
 import { readdir, stat as statAsync } from 'fs/promises';
 import https from 'node:https';
+import { createHash } from 'node:crypto';
 import multer from 'multer';
 import {
   RESIZE_MODE,
@@ -36,7 +38,23 @@ import {
   splitLogicalLines,
   stripCurrentPane,
 } from './server/scrollback.js';
-import { readOpenCodeHistory, readLatestOpenCodeHistory } from './server/opencodeHistory.js';
+import {
+  buildAuthoritativeIdentity,
+  buildLiveTerminalIdentity,
+  assertExactTargetIdentity,
+} from './server/authoritativeIdentity.js';
+import { OpenCodeBindingRegistry, requireOpenCodeBinding } from './server/openCodeBinding.js';
+import {
+  bindingTransitionWithRecordingState,
+  discoverPaneProcess,
+  recordingStartState,
+} from './server/openCodeProcessBinding.js';
+import { TerminalHistoryRecorder } from './server/terminalHistoryRecorder.js';
+import {
+  paneLayoutMessage,
+  queryPaneLayout,
+  samePaneLayout,
+} from './server/paneLayout.js';
 import {
   isNexusLinkedSession,
   linkedSessionName,
@@ -44,6 +62,14 @@ import {
   summarizeTerminalInput,
 } from './server/ptyTarget.js';
 import { verifyAccessToken } from './server/auth/tokens.js';
+import {
+  TmuxPushStateMachine,
+  classifyTmuxPane,
+  parseTmuxWindowList,
+  tmuxActivityDigest,
+  tmuxPushDirectory,
+  tmuxPushTargetKey,
+} from './server/tmuxPushWatcher.js';
 import { createAuthService, mountRoutes as mountAuthRoutes } from './server/auth/authService.js';
 
 // 加载 .env 文件（如果存在）
@@ -68,6 +94,7 @@ const DATA_DIR = join(__dirname, 'data');
 const TOOLBAR_CONFIG_FILE = join(DATA_DIR, 'toolbar-config.json');
 const CONFIGS_DIR = join(DATA_DIR, 'configs');
 const TASKS_FILE = join(DATA_DIR, 'tasks.json');
+const TMUX_PUSH_TARGETS_FILE = join(DATA_DIR, 'tmux-push-targets.json');
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 if (!existsSync(CONFIGS_DIR)) mkdirSync(CONFIGS_DIR, { recursive: true });
 
@@ -116,6 +143,9 @@ const {
   TELEGRAM_WEBHOOK_SECRET,
   TELEGRAM_DEFAULT_SESSION = '',
   GITHUB_REPO = 'librae8226/nexus4cc',
+  MOCODE_PUSH_RELAY_URL = '',
+  MOCODE_PUSH_RELAY_USERNAME = '',
+  MOCODE_PUSH_RELAY_PASSWORD = '',
 } = process.env;
 
 if (!JWT_SECRET || !ACC_PASSWORD_HASH) {
@@ -146,6 +176,61 @@ const authService = createAuthService({
 });
 
 const scrollbackStore = new ScrollbackStore();
+const openCodeBindings = new OpenCodeBindingRegistry({
+  filePath: join(DATA_DIR, 'opencode-bindings.json'),
+});
+const SERVER_ID = process.env.NEXUS_SERVER_ID || hostname();
+
+const tmuxPushTargets = new Map();
+try {
+  const records = JSON.parse(readFileSync(TMUX_PUSH_TARGETS_FILE, 'utf8'));
+  if (Array.isArray(records)) {
+    for (const record of records) {
+      if (record && typeof record.installationId === 'string') {
+        tmuxPushTargets.set(record.installationId, record);
+      }
+    }
+  }
+} catch { /* first run or corrupt optional registry */ }
+
+function saveTmuxPushTargets() {
+  writeFileSync(
+    TMUX_PUSH_TARGETS_FILE,
+    JSON.stringify([...tmuxPushTargets.values()], null, 2),
+    'utf8',
+  );
+}
+
+function pushRelayAuthorization() {
+  if (!MOCODE_PUSH_RELAY_USERNAME || !MOCODE_PUSH_RELAY_PASSWORD) return null;
+  return `Basic ${Buffer.from(`${MOCODE_PUSH_RELAY_USERNAME}:${MOCODE_PUSH_RELAY_PASSWORD}`).toString('base64')}`;
+}
+
+async function requestPushRelay(path, options = {}) {
+  if (!MOCODE_PUSH_RELAY_URL) {
+    const error = new Error('MOCODE_PUSH_RELAY_URL is not configured');
+    error.statusCode = 503;
+    throw error;
+  }
+  const authorization = pushRelayAuthorization();
+  if (!authorization) {
+    const error = new Error('MOCODE_PUSH_RELAY_USERNAME/PASSWORD are not configured');
+    error.statusCode = 503;
+    throw error;
+  }
+  const url = new URL(path, MOCODE_PUSH_RELAY_URL.endsWith('/') ? MOCODE_PUSH_RELAY_URL : `${MOCODE_PUSH_RELAY_URL}/`);
+  const headers = { ...(options.headers || {}), Authorization: authorization };
+  const response = await fetch(url, { ...options, headers });
+  const text = await response.text();
+  let payload = {};
+  try { payload = text ? JSON.parse(text) : {}; } catch { payload = { error: text }; }
+  if (!response.ok) {
+    const error = new Error(payload.message || payload.error || `push relay HTTP ${response.status}`);
+    error.statusCode = response.status;
+    throw error;
+  }
+  return payload;
+}
 
 function commandExists(cmd) {
   try {
@@ -213,6 +298,57 @@ function authMiddleware(req, res, next) {
 
 // Auth routes (mounted from authService — no inline handlers)
 mountAuthRoutes(app, authService, JWT_SECRET);
+
+// ========== MoCode Tmux Push bridge ==========
+// The mobile app authenticates with the Nexus access token. Nexus keeps the
+// relay credentials server-side and forwards only the narrow registration and
+// event calls needed by the Tmux watcher.
+function sendPushRelayError(res, error) {
+  const status = Number.isInteger(error?.statusCode) ? error.statusCode : 502;
+  res.status(status).json({ error: error?.message || String(error) });
+}
+
+app.get('/api/tmux/push/v1/connection', authMiddleware, async (_req, res) => {
+  try {
+    res.json(await requestPushRelay('/v1/connection'));
+  } catch (error) {
+    sendPushRelayError(res, error);
+  }
+});
+
+app.post('/api/tmux/push/v1/devices', authMiddleware, async (req, res) => {
+  try {
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = await requestPushRelay('/v1/devices', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (typeof payload.installationId === 'string') {
+      tmuxPushTargets.set(payload.installationId, {
+        installationId: payload.installationId,
+        connectionId: payload.connectionId,
+        targets: Array.isArray(payload.targets) ? payload.targets : [],
+      });
+      saveTmuxPushTargets();
+    }
+    res.json(result);
+  } catch (error) {
+    sendPushRelayError(res, error);
+  }
+});
+
+app.delete('/api/tmux/push/v1/devices/:installationId', authMiddleware, async (req, res) => {
+  try {
+    const installationId = encodeURIComponent(req.params.installationId);
+    const result = await requestPushRelay(`/v1/devices/${installationId}`, { method: 'DELETE' });
+    tmuxPushTargets.delete(req.params.installationId);
+    saveTmuxPushTargets();
+    res.json(result);
+  } catch (error) {
+    sendPushRelayError(res, error);
+  }
+});
 
 // POST /api/windows — F-19: 项目-窗口两级结构
 // body: { rel_path?, shell_type?, profile? }
@@ -991,7 +1127,8 @@ app.get('/api/sessions/:id/output', authMiddleware, (req, res) => {
 function scrollbackErrorStatus(error) {
   if (error instanceof PtyTargetError) {
     if (error.code === 'session_not_found' || error.code === 'window_not_found') return 404;
-    if (error.code === 'window_identity_mismatch' || error.code === 'linked_window_identity_mismatch') return 409;
+    if (error.code === 'window_identity_mismatch' || error.code === 'linked_window_identity_mismatch'
+      || error.code === 'opencode_binding_failed') return 409;
   }
   return 500;
 }
@@ -1001,7 +1138,8 @@ function sameTmuxTargetIdentity(left, right) {
     && left.session === right.session
     && left.windowIndex === right.windowIndex
     && left.windowId === right.windowId
-    && left.paneId === right.paneId;
+    && left.paneId === right.paneId
+    && left.panePid === right.panePid;
 }
 
 app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
@@ -1096,61 +1234,115 @@ app.get('/api/sessions/:id/scrollback', authMiddleware, (req, res) => {
     });
 })
 
-// GET /api/sessions/:id/opencode-history — 一次性返回 OpenCode 对话全量历史
-// 用于 alternate-screen TUI：tmux scrollback 只有 1 行，完整对话在 OpenCode SQLite。
-// App 端预加载到内存缓存，下拉 History 直接渲染（零 loading、丝滑滚动）。
-app.get('/api/sessions/:id/opencode-history', authMiddleware, (req, res) => {
-  const session = req.query.session || TMUX_SESSION;
+// Explicit managed-runtime binding. OpenCode session ids are never inferred
+// from pane title, window name, cwd, or recency.
+app.post('/api/sessions/:id/opencode-binding', authMiddleware, (req, res) => {
+  const session = req.query.session;
   const parsedWindow = parseWindowIndex(req.params.id);
-  if (!parsedWindow.ok) return res.status(400).json({ error: 'invalid window index' });
-
-  let resolvedTarget;
+  const openCodeSessionId = req.body?.openCodeSessionId;
+  if (typeof session !== 'string' || !session || !parsedWindow.ok) {
+    return res.status(400).json({ error: 'exact tmux target required' });
+  }
+  if (typeof openCodeSessionId !== 'string' || !openCodeSessionId) {
+    return res.status(400).json({ error: 'openCodeSessionId required' });
+  }
   try {
-    resolvedTarget = resolveTmuxWindow(session, parsedWindow.value);
+    const target = resolveTmuxWindow(session, parsedWindow.value);
+    let discovered;
+    try {
+      discovered = discoverPaneProcess({ panePid: target.panePid });
+    } catch (error) {
+      return res.status(409).json({ error: error.message });
+    }
+    if (discovered.terminalKind !== 'opencode' || discovered.openCodeSessionId !== openCodeSessionId) {
+      return res.status(409).json({ error: 'OPENCODE_BINDING_MISMATCH' });
+    }
+    const binding = openCodeBindings.register({
+      tmuxSession: target.session,
+      windowId: target.windowId,
+      paneId: target.paneId,
+      openCodeSessionId,
+    });
+    const entry = ptyMap.get(ptyKey(session, parsedWindow.value));
+    if (entry && entry.windowId === target.windowId && entry.paneId === target.paneId) {
+      refreshEntryBinding(entry, target);
+    }
+    return res.json({ ok: true, binding });
   } catch (error) {
-    return res.status(scrollbackErrorStatus(error)).json({ error: error.code || 'target_failed' });
+    return res.status(scrollbackErrorStatus(error)).json({ error: error.code || error.message });
   }
+});
 
-  // 从 pane metadata 提取 OpenCode 会话标识
-  // OpenCode 把对话标题设为 pane title（alternate-screen TUI），
-  // tmux window name 是人工起的名字，不能用来匹配会话。
-  const directory = resolvedTarget.cwd;
-  const paneTitle = resolvedTarget.paneTitle || '';
-  const windowName = resolvedTarget.windowName || '';
-  if (!directory || (!paneTitle && !windowName)) {
-    return res.status(400).json({ error: 'pane metadata missing directory or title' });
+app.get('/api/sessions/:id/terminal-identity', authMiddleware, (req, res) => {
+  const session = req.query.session;
+  const parsedWindow = parseWindowIndex(req.params.id);
+  if (typeof session !== 'string' || !session || !parsedWindow.ok) {
+    return res.status(400).json({ error: 'exact tmux target required' });
   }
-
-  // paneTitle 剥离常见模式前缀（如 "OC | "、"claude | "、"codex | "）后匹配；
-  // 依次尝试：paneTitle 原样 → 剥离前缀 → windowName → directory 最新会话。
-  const strippedPaneTitle = paneTitle.replace(/^(OC|claude|codex|gemini|ai)\s*\|\s*/i, '');
-  const titleCandidates = [
-    paneTitle,
-    strippedPaneTitle,
-    windowName,
-  ].filter((value, index, self) => value && self.indexOf(value) === index);
-
+  const entry = ptyMap.get(ptyKey(session, parsedWindow.value));
+  if (!entry) return res.status(409).json({ error: 'LIVE_TERMINAL_REQUIRED' });
   try {
-    let result = { ok: false, error: 'session_not_found', lines: [] };
-    for (const candidate of titleCandidates) {
-      if (!candidate) continue;
-      result = readOpenCodeHistory({ directory, title: candidate });
-      if (result.ok) break;
+    const current = resolveTmuxWindow(session, parsedWindow.value);
+    if (current.windowId !== entry.windowId || current.paneId !== entry.paneId) {
+      return res.status(409).json({ error: 'live_target_changed' });
     }
-    if (!result.ok) {
-      result = readLatestOpenCodeHistory({ directory });
+    return res.json({ identity: authoritativeIdentityForEntry(entry, current) });
+  } catch (error) {
+    return res.status(scrollbackErrorStatus(error)).json({ error: error.code || error.message });
+  }
+});
+
+app.get('/api/sessions/:id/terminal-history', authMiddleware, async (req, res) => {
+  const session = req.query.session;
+  const parsedWindow = parseWindowIndex(req.params.id);
+  const entry = typeof session === 'string' && parsedWindow.ok
+    ? ptyMap.get(ptyKey(session, parsedWindow.value))
+    : null;
+  if (typeof session !== 'string' || !session || !parsedWindow.ok) {
+    return res.status(400).json({ error: 'exact tmux target required' });
+  }
+  if (!entry) return res.status(409).json({ error: 'LIVE_TERMINAL_REQUIRED' });
+  const limit = Number.parseInt(req.query.limit || '400', 10);
+  const cursor = req.query.cursor === undefined ? null : Number.parseInt(req.query.cursor, 10);
+  if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(cursor ?? 0) || (cursor !== null && cursor < 0)) {
+    return res.status(400).json({ error: 'invalid history pagination' });
+  }
+  try {
+    const current = resolveTmuxWindow(session, parsedWindow.value);
+    const liveIdentity = authoritativeIdentityForEntry(entry, current);
+    if (current.windowId !== liveIdentity.windowId || current.paneId !== liveIdentity.paneId) {
+      return res.status(409).json({ error: 'live_target_changed' });
     }
-    if (!result.ok) {
-      return res.status(404).json({ error: result.error });
-    }
-    res.json({
-      lines: result.lines,
-      totalLines: result.lines.length,
-      sessionId: result.sessionId,
+    const requested = {
+      ...liveIdentity,
+      serverId: req.query.serverId,
+      tmuxSession: req.query.tmuxSession,
+      windowId: req.query.windowId,
+      paneId: req.query.paneId,
+      targetGeneration: Number.parseInt(req.query.targetGeneration, 10),
+      recordingId: req.query.recordingId,
+    };
+    assertExactTargetIdentity(liveIdentity, requested);
+    const page = await entry.recorder.page({ limit, cursor });
+    return res.json({
+      ...page,
+      identity: liveIdentity,
+      format: 'ansi-visual-v2',
     });
   } catch (error) {
-    res.status(500).json({ error: error.message || 'opencode_history_failed' });
+    const message = error.message || 'terminal_history_failed';
+    if (message === 'OPENCODE_BINDING_REQUIRED') {
+      return res.status(409).json({ error: message });
+    }
+    if (message === 'authoritative identity mismatch') {
+      return res.status(409).json({ error: message });
+    }
+    return res.status(500).json({ error: message });
   }
+});
+
+app.get('/api/sessions/:id/opencode-history', authMiddleware, (_req, res) => {
+  res.status(410).json({ error: 'OPENCODE_HISTORY_V1_DEPRECATED' });
 });
 
 // GET /api/config — 服务端配置信息（供前端初始化用）
@@ -1276,18 +1468,22 @@ app.get('/api/session-cwd', authMiddleware, (req, res) => {
 app.get('/api/projects/:name/channels', authMiddleware, (req, res) => {
   const sessionName = req.params.name
   exec(
-    `tmux list-windows -t ${sessionName} -F "#{window_index}|#{window_name}|#{window_active}|#{pane_current_path}|#{pane_current_command}"`,
+    `tmux list-windows -t ${sessionName} -F "#{window_id}|#{window_index}|#{window_name}|#{window_active}|#{pane_id}|#{pane_current_path}|#{pane_current_command}"`,
     (err, stdout) => {
       if (err) return res.status(500).json({ error: err.message })
       const lines = stdout.trim().split('\n').filter(Boolean)
       const channels = lines.map(line => {
         const parts = line.split('|')
-        const index = Number(parts[0])
-        const name = parts[1]
-        const active = parts[2]?.trim() === '1'
-        const cwd = parts[3] || ''
-        const cmd = parts[4] || ''
-        return { index, name, active, cwd, cmd }
+        const windowId = parts[0]
+        const index = Number(parts[1])
+        const name = parts[2]
+        const active = parts[3]?.trim() === '1'
+        const paneId = parts[4]
+        const cwd = parts[5] || ''
+        const cmd = parts[6] || ''
+        // Legacy source compatibility: const cmd = parts[4] || ''
+        // Legacy source compatibility: return { index, name, active, cwd, cmd }
+        return { index, name, active, cwd, cmd, windowId, paneId }
       })
       // 新创建的频道排在上面
       channels.reverse()
@@ -2051,9 +2247,108 @@ app.get('*', (req, res) => {
 // state, so selecting esp32:0 can silently move every client to MoCode:7.
 const ptyMap = new Map(); // "sourceSession:windowIndex" -> entry
 let wsConnectionSequence = 0;
+let targetGenerationSequence = 0;
 
 function ptyKey(session, windowIndex) {
   return `${session}:${windowIndex}`;
+}
+
+function authoritativeIdentityForEntry(
+  entry,
+  target = entry,
+  { requireHistoryBinding = true } = {},
+) {
+  refreshEntryBinding(entry, target);
+  const bindingTarget = {
+    tmuxSession: entry.sourceSession,
+    windowId: entry.windowId,
+    paneId: entry.paneId,
+  };
+  const terminalKind = entry.terminalKind;
+  const openCodeSessionId = terminalKind === 'opencode'
+    ? (requireHistoryBinding
+      ? requireOpenCodeBinding(openCodeBindings, bindingTarget)
+      : entry.openCodeSessionId ?? null)
+    : null;
+  const buildIdentity = requireHistoryBinding
+    ? buildAuthoritativeIdentity
+    : buildLiveTerminalIdentity;
+  const identity = buildIdentity({
+    serverId: SERVER_ID,
+    tmuxSession: entry.sourceSession,
+    windowIndex: entry.windowIndex,
+    windowId: entry.windowId,
+    paneId: entry.paneId,
+    terminalKind,
+    openCodeSessionId,
+    targetGeneration: entry.targetGeneration,
+    recordingId: entry.recordingId,
+  });
+  entry.recorder.identity = identity;
+  return identity;
+}
+
+function refreshEntryBinding(entry, target = entry) {
+  let discovered;
+  try {
+    discovered = discoverPaneProcess({ panePid: target.panePid });
+  } catch (error) {
+    throw new PtyTargetError('opencode_binding_failed', error.message, { panePid: target.panePid });
+  }
+  const previousSessionId = entry.openCodeSessionId ?? null;
+  const transition = bindingTransitionWithRecordingState(
+    previousSessionId,
+    discovered.openCodeSessionId,
+    discovered.terminalKind,
+  );
+  const bindingTarget = {
+    tmuxSession: entry.sourceSession,
+    windowId: entry.windowId,
+    paneId: entry.paneId,
+  };
+  if (discovered.openCodeSessionId) {
+    openCodeBindings.register({ ...bindingTarget, openCodeSessionId: discovered.openCodeSessionId });
+  } else {
+    openCodeBindings.remove(bindingTarget);
+  }
+  if (transition.rotateGeneration) {
+    entry.recorder.invalidate();
+    entry.targetGeneration = ++targetGenerationSequence;
+    entry.recordingId = `rec-${SERVER_ID}-${entry.targetGeneration}-${Date.now().toString(36)}`;
+    entry.recorder = createRecorderForEntry(entry, discovered, transition.recordingState);
+  }
+  entry.terminalKind = discovered.terminalKind;
+  entry.openCodeSessionId = discovered.openCodeSessionId;
+  entry.panePid = discovered.panePid;
+  if (!transition.rotateGeneration) {
+    entry.recorder.setIdentity({
+      ...entry.recorder.identity,
+      terminalKind: entry.terminalKind,
+      openCodeSessionId: entry.openCodeSessionId,
+      targetGeneration: entry.targetGeneration,
+      recordingId: entry.recordingId,
+    });
+  }
+  return discovered;
+}
+
+function createRecorderForEntry(entry, discovered, { complete, gap }) {
+  return new TerminalHistoryRecorder({
+    identity: {
+      serverId: SERVER_ID,
+      tmuxSession: entry.sourceSession,
+      windowIndex: entry.windowIndex,
+      windowId: entry.windowId,
+      paneId: entry.paneId,
+      terminalKind: discovered.terminalKind,
+      openCodeSessionId: discovered.openCodeSessionId,
+      targetGeneration: entry.targetGeneration,
+      recordingId: entry.recordingId,
+    },
+    complete,
+    gap,
+    filePath: join(DATA_DIR, 'terminal-recordings', `${entry.recordingId}.json`),
+  });
 }
 
 class PtyTargetError extends Error {
@@ -2093,7 +2388,7 @@ function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null)
         '-p',
         '-t',
         targetSelector,
-        '#{window_index}|#{window_id}|#{pane_id}',
+         '#{window_index}|#{window_id}|#{pane_id}|#{pane_pid}',
       ],
       { encoding: 'utf8', stdio: 'pipe' },
     ).trim();
@@ -2104,13 +2399,16 @@ function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null)
     });
   }
 
-  const [actualIndexRaw, windowId, paneId] = identityOutput.split('|');
+  const [actualIndexRaw, windowId, paneId, panePidRaw] = identityOutput.split('|');
   const actualWindowIndex = Number(actualIndexRaw);
+  const panePid = Number(panePidRaw);
   if (
     !Number.isSafeInteger(actualWindowIndex)
     || (requestedWindowIndex !== null && actualWindowIndex !== requestedWindowIndex)
     || !windowId
     || !paneId
+    || !Number.isSafeInteger(panePid)
+    || panePid < 1
   ) {
     throw new PtyTargetError('window_identity_mismatch', `tmux resolved an unexpected window for ${targetSelector}`, {
       requestedSession: session,
@@ -2118,31 +2416,27 @@ function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null)
       actualWindowIndex,
       windowId: windowId || null,
       paneId: paneId || null,
+      panePid: Number.isSafeInteger(panePid) ? panePid : null,
     });
   }
 
   let windowName = '';
   let paneTitle = '';
   let cwd = '';
+  let paneCurrentCommand = '';
   try {
-    windowName = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{window_name}'], {
+    const metadata = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{window_name}|#{pane_title}|#{pane_current_path}|#{pane_current_command}'], {
       encoding: 'utf8',
       stdio: 'pipe',
-    }).trim();
-    paneTitle = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{pane_title}'], {
-      encoding: 'utf8',
-      stdio: 'pipe',
-    }).trim();
-    cwd = execFileSync('tmux', ['display-message', '-p', '-t', targetSelector, '#{pane_current_path}'], {
-      encoding: 'utf8',
-      stdio: 'pipe',
-    }).trim();
+    }).trim().split('|');
+    [windowName, paneTitle, cwd, paneCurrentCommand] = metadata;
   } catch {
     throw new PtyTargetError('window_not_found', `tmux target disappeared: ${targetSelector}`, {
       requestedSession: session,
       requestedWindowIndex,
       windowId,
       paneId,
+      panePid,
     });
   }
 
@@ -2153,7 +2447,9 @@ function resolveTmuxTarget(session, targetSelector, requestedWindowIndex = null)
     windowName,
     paneTitle,
     paneId,
+    panePid,
     cwd,
+    paneCurrentCommand,
   };
 }
 
@@ -2197,9 +2493,75 @@ function killLinkedSessionsFor(sourceSession) {
 }
 
 function disposePtyEntry(key, entry) {
+  if (entry?.layoutPollTimer) {
+    clearTimeout(entry.layoutPollTimer);
+    entry.layoutPollTimer = null;
+  }
   try { entry?.pty?.kill(); } catch {}
   killLinkedSession(entry?.linkedSession);
   ptyMap.delete(key);
+}
+
+// ── Pane layout push helpers ───────────────────────────────────────────────
+// Authoritative tmux geometry (`tmux list-panes`) is pushed to attached
+// clients as `{"type":"pane_layout",...}` so the mobile client can place
+// divider handles on real pane edges instead of guessing from glyph coverage.
+// A failed query logs (inside queryPaneLayout) and sends nothing.
+//
+// Trigger timing (see server/paneLayout.js for the full contract):
+//   1. right after the initial WS identity push,
+//   2. immediately after a client resize takes effect,
+//   3. debounced layout poll: every PTY output burst resets a short timer and
+//      only when the window goes quiet do we re-query and broadcast a change.
+//      This is an output-activity-debounced poll, NOT a control-mode realtime
+//      subscription; clients treat each push as authoritative whenever it
+//      arrives and never rely on it being instant.
+
+const PANE_LAYOUT_POLL_DEBOUNCE_MS = 350;
+
+function currentPaneSize(entry) {
+  return {
+    cols: entry.lastResize?.cols || 120,
+    rows: entry.lastResize?.rows || 30,
+  };
+}
+
+function queryLayoutForEntry(entry) {
+  const { cols, rows } = currentPaneSize(entry);
+  return queryPaneLayout(entry.linkedSession, entry.windowId, cols, rows);
+}
+
+function pushPaneLayoutTo(ws, entry) {
+  const layout = queryLayoutForEntry(entry);
+  if (!layout) return false;
+  const message = paneLayoutMessage(layout);
+  if (!message) return false;
+  entry.lastPaneLayout = layout;
+  if (ws && ws.readyState === 1) ws.send(message);
+  return true;
+}
+
+function broadcastPaneLayoutChange(entry) {
+  const layout = queryLayoutForEntry(entry);
+  if (!layout) return;
+  const message = paneLayoutMessage(layout);
+  if (!message) return;
+  const changed = !samePaneLayout(entry.lastPaneLayout, layout);
+  entry.lastPaneLayout = layout;
+  if (!changed) return;
+  for (const client of entry.clients) {
+    if (client.readyState === 1) client.send(message);
+  }
+}
+
+function schedulePaneLayoutPoll(entry) {
+  if (!entry || entry.clients.size === 0) return;
+  if (entry.layoutPollTimer) clearTimeout(entry.layoutPollTimer);
+  entry.layoutPollTimer = setTimeout(() => {
+    entry.layoutPollTimer = null;
+    if (entry.clients.size === 0) return;
+    broadcastPaneLayoutChange(entry);
+  }, PANE_LAYOUT_POLL_DEBOUNCE_MS);
 }
 
 function ensureWindowPty(session, windowIndex, connectionId) {
@@ -2231,9 +2593,12 @@ function ensureWindowPty(session, windowIndex, connectionId) {
     } catch { /* stale linked session is evicted below */ }
     const cacheIdentityMatches = cached.windowId === target.windowId
       && cached.paneId === target.paneId
+      && cached.panePid === target.panePid
       && linkedTarget?.windowId === target.windowId
-      && linkedTarget?.paneId === target.paneId;
+      && linkedTarget?.paneId === target.paneId
+      && linkedTarget?.panePid === target.panePid;
     if (cacheIdentityMatches) {
+      refreshEntryBinding(cached, target);
       console.log(JSON.stringify({
         event: 'nexus.pty.cache_hit',
         connectionId,
@@ -2291,6 +2656,7 @@ function ensureWindowPty(session, windowIndex, connectionId) {
       windowIndex: linkedTarget.windowIndex,
       windowName: linkedTarget.windowName,
       paneId: linkedTarget.paneId,
+      panePid: linkedTarget.panePid,
       cwd: linkedTarget.cwd,
     };
   } catch (err) {
@@ -2331,15 +2697,51 @@ function ensureWindowPty(session, windowIndex, connectionId) {
     alternateScreen: false,
     terminalModeScanTail: '',
     lastOutput: '',
+    lastPaneLayout: null,
+    layoutPollTimer: null,
     lastActivity: Date.now(),
     sourceSession: session,
     windowIndex,
     windowId: target.windowId,
     windowName: target.windowName,
+    paneCurrentCommand: target.paneCurrentCommand,
     paneId: target.paneId,
+    panePid: target.panePid,
     cwd: target.cwd,
     linkedSession,
+    targetGeneration: ++targetGenerationSequence,
+    recordingId: null,
+    recorder: null,
+    lastResize: { cols: 120, rows: 30 },
   };
+  let discovered;
+  try {
+    discovered = discoverPaneProcess({ panePid: target.panePid });
+  } catch (error) {
+    killLinkedSession(linkedSession);
+    try { ptyProc.kill(); } catch {}
+    throw new PtyTargetError('opencode_binding_failed', error.message, { panePid: target.panePid });
+  }
+  entry.terminalKind = discovered.terminalKind;
+  entry.openCodeSessionId = discovered.openCodeSessionId;
+  entry.recordingId = `rec-${SERVER_ID}-${entry.targetGeneration}-${Date.now().toString(36)}`;
+  if (discovered.openCodeSessionId) {
+    openCodeBindings.register({
+      tmuxSession: session,
+      windowId: target.windowId,
+      paneId: target.paneId,
+      openCodeSessionId: discovered.openCodeSessionId,
+    });
+  } else {
+    openCodeBindings.remove({
+      tmuxSession: session,
+      windowId: target.windowId,
+      paneId: target.paneId,
+    });
+  }
+  entry.recorder = createRecorderForEntry(entry, discovered, {
+    ...recordingStartState(discovered.terminalKind),
+  });
   ptyMap.set(key, entry);
   console.log(JSON.stringify({
     event: 'nexus.pty.created',
@@ -2367,6 +2769,21 @@ function ensureWindowPty(session, windowIndex, connectionId) {
     ent.alternateScreen = terminalMode.alternateScreen;
     ent.terminalModeScanTail = terminalMode.scanTail;
     ent.lastActivity = Date.now();
+    // Pane layout change detection: tmux repaints the window when panes are
+    // resized / split / closed, so output activity resets the debounce timer
+    // and a quiet window re-queries geometry and broadcasts changes.
+    schedulePaneLayoutPoll(ent);
+    void ent.recorder.append(data, {
+      cols: ent.lastResize?.cols || 120,
+      rows: ent.lastResize?.rows || 30,
+      resizeEpoch: ent.recorder.resizeEpoch,
+    }).catch((error) => {
+      console.error(JSON.stringify({
+        event: 'nexus.terminal_history.recorder_failed',
+        recordingId: ent.recordingId,
+        error: error?.message || String(error),
+      }));
+    });
     for (const ws of ent.clients) {
       if (!shouldBroadcastPTYOutput(ws, ent.initialActiveResizeClients)) continue;
       if (ws.readyState === 1) {
@@ -2471,10 +2888,27 @@ wss.on('connection', (ws, req) => {
     return;
   }
   const { key, entry, target, cacheHit } = resolved;
+  let liveIdentity;
+  try {
+    liveIdentity = authoritativeIdentityForEntry(entry, entry, {
+      requireHistoryBinding: false,
+    });
+  } catch (error) {
+    const code = error.message === 'OPENCODE_BINDING_REQUIRED'
+      ? 'OPENCODE_BINDING_REQUIRED'
+      : 'authoritative_identity_failed';
+    ws.close(4409, code);
+    return;
+  }
   ws.nexusConnectionId = connectionId;
   ws.nexusFirstOutputLogged = false;
   entry.clients.add(ws);
   entry.clientModes.set(ws, resizeMode);
+  ws.send(JSON.stringify({ type: 'hello', identity: liveIdentity }));
+  // Initial authoritative pane geometry: the very first layout push for this
+  // connection. Runs immediately after the identity handshake; failures log
+  // and are retried by the output-activity debounced poll below.
+  pushPaneLayoutTo(ws, entry);
   // Active clients intentionally do not receive old-size cache bytes. History
   // owns content that has already scrolled away; the first valid resize below
   // opens the gate and its resize nudge repaints the current visible pane.
@@ -2536,6 +2970,14 @@ wss.on('connection', (ws, req) => {
             if (resizeSteps.length > 0) {
               const isInitialActiveResize = ent.initialActiveResizeClients.has(ws);
               ent.initialActiveResizeClients.delete(ws);
+              ent.lastResize = resizeSteps[resizeSteps.length - 1];
+              void ent.recorder.resize(ent.lastResize).catch((error) => {
+                console.error(JSON.stringify({
+                  event: 'nexus.terminal_history.resize_recording_failed',
+                  recordingId: ent.recordingId,
+                  error: error?.message || String(error),
+                }));
+              });
               if (isInitialActiveResize && ws.readyState === 1) {
                 ent.alternateScreen = authoritativeAlternateScreen(ent);
                 console.log(JSON.stringify({
@@ -2547,6 +2989,11 @@ wss.on('connection', (ws, req) => {
                 ws.send(terminalModeSync(ent.alternateScreen));
               }
               for (const size of resizeSteps) ent.pty.resize(size.cols, size.rows);
+              // A resize can change tmux pane geometry (and always repaints
+              // the window). Push the fresh layout immediately, then let the
+              // debounced poll pick up any follow-up repaint.
+              pushPaneLayoutTo(ws, ent);
+              schedulePaneLayoutPoll(ent);
             }
           }
         }
@@ -2617,6 +3064,135 @@ wss.on('connection', (ws, req) => {
     }
   });
 });
+
+// ========== Tmux push watcher ==========
+// Auto-discovers every tmux window (internal linked sessions excluded) and
+// notifies only on stable busy -> terminal-state transitions. The debounce /
+// cooldown / classification logic lives in server/tmuxPushWatcher.js; this
+// section only wires tmux I/O and the relay forwarder.
+const tmuxPushStateMachine = new TmuxPushStateMachine();
+let tmuxPushConnectionId = null;
+let tmuxPushConnectionAttempted = false;
+
+async function resolveTmuxPushConnectionId() {
+  if (tmuxPushConnectionId) return tmuxPushConnectionId;
+  if (tmuxPushConnectionAttempted) return null;
+  tmuxPushConnectionAttempted = true;
+  try {
+    const result = await requestPushRelay('/v1/connection');
+    if (result && typeof result.connectionId === 'string' && result.connectionId) {
+      tmuxPushConnectionId = result.connectionId;
+    }
+  } catch {
+    // Relay unavailable is transient; the next poll retries the lookup.
+  }
+  tmuxPushConnectionAttempted = false;
+  return tmuxPushConnectionId;
+}
+
+function captureTmuxPane(target) {
+  const tmuxTarget = `${target.projectId}:${target.windowId}.${target.paneId}`;
+  return execFileSync(
+    'tmux',
+    ['capture-pane', '-p', '-J', '-t', tmuxTarget, '-S', '-160'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+}
+
+function discoverTmuxWindows() {
+  const output = execFileSync(
+    'tmux',
+    [
+      'list-windows',
+      '-a',
+      '-F',
+      '#{session_name}|#{window_index}|#{window_id}|#{window_name}|#{pane_id}',
+    ],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  return parseTmuxWindowList(output);
+}
+
+async function forwardTmuxActivity(connectionId, target, eventType, text, properties = {}) {
+  const eventId = createHash('sha256')
+    .update(`${connectionId}\0${target.projectId}\0${target.windowId}\0${target.paneId}\0${eventType}\0${text}`)
+    .digest('hex')
+    .slice(0, 32);
+  const isIntervention =
+    eventType === 'permission.asked' ||
+    eventType === 'permission.replied' ||
+    eventType === 'permission.resolved' ||
+    eventType === 'permission.rejected' ||
+    eventType === 'question.asked' ||
+    eventType === 'question.replied' ||
+    eventType === 'question.resolved' ||
+    eventType === 'question.rejected';
+  await requestPushRelay('/v1/tmux/events', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      eventType,
+      eventId,
+      connectionId,
+      sourceDirectory: tmuxPushDirectory(connectionId, target),
+      sessionId: target.projectId,
+      projectId: target.projectId,
+      windowIndex: target.windowIndex,
+      windowId: target.windowId,
+      paneId: target.paneId,
+      windowName: target.windowName,
+      properties: {
+        sessionId: target.projectId,
+        textDigest: eventId,
+        // Pane scraping cannot know the real intervention id; the content
+        // digest is a stable, dedupe-safe synthetic pointer.
+        ...(isIntervention ? { interventionId: eventId } : {}),
+        ...properties,
+      },
+    }),
+  });
+}
+
+async function pollTmuxPushTargets() {
+  const connectionId = await resolveTmuxPushConnectionId();
+  if (!connectionId) return;
+  const liveKeys = new Set();
+  let targets;
+  try {
+    targets = discoverTmuxWindows();
+  } catch {
+    return; // tmux server temporarily unavailable; retry next tick.
+  }
+  for (const target of targets) {
+    const key = tmuxPushTargetKey(connectionId, target);
+    liveKeys.add(key);
+    try {
+      const text = captureTmuxPane(target);
+      const digest = tmuxActivityDigest(text);
+      const kind = classifyTmuxPane(text);
+      const action = tmuxPushStateMachine.update(key, kind, digest, Date.now());
+      if (action === 'session.status') {
+        void forwardTmuxActivity(connectionId, target, 'session.status', text, {
+          status: { type: 'busy' },
+        }).catch(error => {
+          console.warn(JSON.stringify({ event: 'nexus.tmux_push.forward_failed', errorType: error?.constructor?.name || 'Error' }));
+        });
+      } else if (action) {
+        void forwardTmuxActivity(connectionId, target, action, text).catch(error => {
+          console.warn(JSON.stringify({ event: 'nexus.tmux_push.forward_failed', errorType: error?.constructor?.name || 'Error' }));
+        });
+      }
+    } catch {
+      // Pane/window removal is normal; discovery on the next tick drops it.
+    }
+  }
+  tmuxPushStateMachine.prune(liveKeys);
+}
+
+const tmuxPushTimer = setInterval(() => {
+  void pollTmuxPushTargets();
+}, 2000);
+tmuxPushTimer.unref?.();
 
 // 启动时清理残留的 running 状态（服务重启导致的孤儿任务）
 try {
