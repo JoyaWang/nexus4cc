@@ -114,14 +114,27 @@ test('stable busy arms once, then stable terminal fires once', () => {
   assert.equal(sm.update(KEY, 'session.idle', digestOf('i3'), now += 2000), null);
 });
 
-test('unchanged content never advances the state machine', () => {
+test('static busy arms once and static finished tail still delivers', () => {
   const sm = new TmuxPushStateMachine();
   let now = EPOCH;
-  assert.equal(sm.update(KEY, 'busy', digestOf('same'), now += 2000), null);
-  assert.equal(sm.update(KEY, 'busy', digestOf('same'), now += 2000), null);
-  assert.equal(sm.update(KEY, 'busy', digestOf('same'), now += 2000), null);
-  // Same digest four times: never armed, no busy announcement.
-  assert.equal(sm.update(KEY, 'session.idle', digestOf('same'), now += 2000), null);
+  // Content never changes: rounds, not digest changes, drive stability.
+  assert.equal(sm.update(KEY, 'busy', digestOf('static-busy'), now += 2000), null);
+  assert.equal(sm.update(KEY, 'busy', digestOf('static-busy'), now += 2000), null);
+  assert.equal(
+    sm.update(KEY, 'busy', digestOf('static-busy'), now += 2000),
+    'session.status',
+  );
+  // The busy announcement is a one-shot even while busy persists.
+  assert.equal(sm.update(KEY, 'busy', digestOf('static-busy'), now += 2000), null);
+  // A finished agent tail stops changing but must still be delivered.
+  assert.equal(sm.update(KEY, 'session.idle', digestOf('static-idle'), now += 2000), null);
+  assert.equal(
+    sm.update(KEY, 'session.idle', digestOf('static-idle'), now += 2000),
+    'session.idle',
+  );
+  // After firing, a static idle pane stays silent.
+  assert.equal(sm.update(KEY, 'session.idle', digestOf('static-idle'), now += 2000), null);
+  assert.equal(sm.update(KEY, 'session.idle', digestOf('static-idle'), now += 2000), null);
 });
 
 test('cooldown suppresses repeats without resetting the window', () => {

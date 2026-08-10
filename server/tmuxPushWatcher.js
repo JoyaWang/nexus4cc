@@ -117,6 +117,10 @@ export class TmuxPushStateMachine {
   /**
    * @returns the terminal kind to send, 'session.status' to announce a newly
    *          armed busy cycle, or null when nothing should be sent.
+   *
+   * Stability is measured in poll rounds, not content changes: a static pane
+   * that keeps its classification still advances the streaks, so a finished
+   * agent whose tail stops changing is still delivered.
    */
   update(key, kind, digest, now) {
     let state = this._states.get(key);
@@ -129,11 +133,10 @@ export class TmuxPushStateMachine {
         pendingStreak: 0,
         lastSentKind: null,
         lastSentAt: new Map(),
+        busyAnnounced: false,
       };
       this._states.set(key, state);
     }
-    if (state.digest === digest) return null;
-    state.digest = digest;
 
     if (kind === 'busy') {
       state.pendingKind = null;
@@ -142,6 +145,9 @@ export class TmuxPushStateMachine {
       if (!state.armed && state.busyStreak >= this.armRounds) {
         state.armed = true;
         state.lastSentKind = null;
+      }
+      if (state.armed && !state.busyAnnounced) {
+        state.busyAnnounced = true;
         return 'session.status';
       }
       return null;
@@ -151,6 +157,7 @@ export class TmuxPushStateMachine {
     if (!TERMINAL_KINDS.has(kind)) {
       // idle_silent: quietly disarm; a shell prompt is not a completion.
       state.armed = false;
+      state.busyAnnounced = false;
       state.pendingKind = null;
       state.pendingStreak = 0;
       return null;
@@ -177,6 +184,7 @@ export class TmuxPushStateMachine {
     state.lastSentAt.set(kind, now);
     state.lastSentKind = kind;
     state.armed = false;
+    state.busyAnnounced = false;
     state.pendingKind = null;
     state.pendingStreak = 0;
     return kind;
